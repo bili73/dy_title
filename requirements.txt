@@ -1,0 +1,12 @@
+# ==============================================================================
+# requirements.txt
+# 抖音商城「拍同款」抓取 - Python 依赖（adb + RapidOCR 方案）
+#
+# 说明：依赖由 uv 管理（见 pyproject.toml / uv.lock），此文件仅作参考。
+# 核心依赖：RapidOCR（文字识别）、OpenCV（模板匹配找图标）。
+# 运行机需另装 Android Platform Tools(adb)，并加入 PATH 或在 config.py 配绝对路径。
+# 不再需要 Appium / Node / JDK。
+# ==============================================================================
+rapidocr-onnxruntime>=1.4.0
+opencv-python>=4.8.0
+numpy>=1.24

@@ -1,0 +1,10 @@
+[project]
+name = "douyin-crawler"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "appium-python-client>=2.11.0",
+    "openpyxl>=3.1.5",
+    "rapidocr-onnxruntime>=1.4.4",
+    "selenium>=4.15.0,<5.0.0",
+]
