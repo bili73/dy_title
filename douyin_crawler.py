@@ -126,30 +126,59 @@ class AdbController:
 # OcrLocator：RapidOCR 识别 + 关键词定位
 # ==============================================================================
 class OcrLocator:
-    """RapidOCR 识别文字，提供按关键词查找、按价格符号定位等方法。"""
+    """OCR 识别文字 + bbox 中心坐标定位。
+
+    走 PaddleOCR HTTP 服务(docker, POST /ocr multipart file)，返回 {lines:[{text,box,score}]}。
+    box 为 4 角点，据此算 cx/cy/top/bottom/left/right，供点击/参数配对使用。
+    """
 
     def __init__(self):
-        # 首次加载模型约 2-3 秒
-        self.engine = RapidOCR()
+        import requests  # 仅此处用，局部导入避免顶部强依赖
+        self._requests = requests
+        self.url = config.OCR_CONFIG["paddleocr_url"]
+        self.timeout = config.OCR_CONFIG["timeout"]
 
     def recognize(self, img_path):
-        """识别图片，返回 item 列表 [{text,cx,cy,box,score}]。"""
-        result, _ = self.engine(img_path)
+        """识别图片，返回 item 列表 [{text,cx,cy,top,bottom,left,right,score}]。
+
+        ⚠️ 依赖服务返回 box；若服务只返回文字(lines 为字符串)则坐标无法获取，会跳过。
+        PaddleOCR CPU 推理较慢，偶发超时，故重试最多 3 次。
+        """
+        import time
+        last_err = None
+        data = None
+        for attempt in range(3):
+            try:
+                with open(img_path, "rb") as f:
+                    resp = self._requests.post(self.url, files={"file": f}, timeout=self.timeout)
+                data = resp.json()
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                if attempt < 2:
+                    time.sleep(1)  # 超时/出错稍等再重试
+        if last_err is not None or data is None:
+            raise RuntimeError(f"OCR 服务请求失败(重试3次): {last_err}")
         items = []
-        if not result:
-            return items
-        for box, text, score in result:
+        for ln in data.get("lines", []):
+            # 兼容：lines 元素可能是 dict(A格式带box) 或 str(旧格式无box)
+            if isinstance(ln, str):
+                continue  # 无坐标，跳过(点击/配对依赖坐标)
+            box = ln.get("box")
+            if not box or len(box) < 4:
+                continue
             xs = [p[0] for p in box]
             ys = [p[1] for p in box]
             items.append({
-                "text": text,
+                "text": ln.get("text", ""),
                 "cx": sum(xs) / 4,
                 "cy": sum(ys) / 4,
                 "top": min(ys),
                 "bottom": max(ys),
                 "left": min(xs),
                 "right": max(xs),
-                "score": float(score),
+                "score": float(ln.get("score", 1.0)),
             })
         return items
 
@@ -183,19 +212,39 @@ class TemplateMatcher:
     def __init__(self, template_dir, threshold=None):
         self.template_dir = template_dir
         self.threshold = threshold or config.TEMPLATE_CONFIG["match_threshold"]
+        self.logger = logging.getLogger("TemplateMatcher")
+
+    @staticmethod
+    def _imread(path):
+        """读取图片(支持中文路径)。
+
+        cv2.imread 在 Windows 不支持中文路径(返回 None)，用 np.fromfile + cv2.imdecode。
+        """
+        return cv2.imdecode(np.fromfile(path, dtype=np.uint8), -1)
 
     def find(self, screenshot_path, template_name):
         """在截图中找模板 template_name，返回 (cx, cy) 或 None。"""
         tpl_path = os.path.join(self.template_dir, template_name)
         if not os.path.exists(tpl_path):
+            self.logger.warning(f"模板不存在: {tpl_path}")
             return None
-        scene = cv2.imread(screenshot_path)
-        tpl = cv2.imread(tpl_path)
+        scene = self._imread(screenshot_path)
+        tpl = self._imread(tpl_path)
         if scene is None or tpl is None:
+            self.logger.warning(f"图片读取失败: scene={screenshot_path} tpl={tpl_path}")
             return None
-        res = cv2.matchTemplate(scene, tpl, cv2.TM_CCOEFF_NORMED)
+        # 统一为 3 通道 BGR(模板/截图可能是 4 通道 BGRA，matchTemplate 要求通道一致)
+        if scene.ndim == 3 and scene.shape[2] == 4:
+            scene = cv2.cvtColor(scene, cv2.COLOR_BGRA2BGR)
+        if tpl.ndim == 3 and tpl.shape[2] == 4:
+            tpl = cv2.cvtColor(tpl, cv2.COLOR_BGRA2BGR)
+        # 用 Canny 边缘匹配(抗颜色/亮度/缩放差异，比直接匹配更适合图标定位)
+        scene_edge = cv2.Canny(cv2.cvtColor(scene, cv2.COLOR_BGR2GRAY), 50, 150)
+        tpl_edge = cv2.Canny(cv2.cvtColor(tpl, cv2.COLOR_BGR2GRAY), 50, 150)
+        res = cv2.matchTemplate(scene_edge, tpl_edge, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, max_loc = cv2.minMaxLoc(res)
         if max_val < self.threshold:
+            self.logger.info(f"匹配 {template_name} 最高相似度 {max_val:.3f} < 阈值 {self.threshold}")
             return None
         h, w = tpl.shape[:2]
         return (max_loc[0] + w / 2, max_loc[1] + h / 2)
@@ -282,8 +331,16 @@ class DouyinCrawler:
         策略：OCR 找顶部「搜索」按钮作锚点 → 相机在其左侧约 90px → 点击 → 验证出现「相册/识别」。
         （已真机验证：搜索按钮 cx≈1289，相机 ≈ left-90 = 1141，点击后进入拍同款页）
         """
-        # 等首页加载：「搜索」按钮出现(冷启动首页加载慢，单次 OCR 易漏)
-        anchor = self._wait_text(["搜索"], timeout=12)
+        # 等首页加载 + 找"搜索"按钮：取最右侧的(真正的搜索按钮，排除左侧搜索框占位文字)
+        anchor = None
+        end = time.time() + 12
+        while time.time() < end:
+            items = self._shot_ocr()
+            candidates = [it for it in items if "搜索" in it["text"] and it["score"] >= 0.5]
+            if candidates:
+                anchor = max(candidates, key=lambda x: x["cx"])  # 最右 = 搜索按钮
+                break
+            time.sleep(1.5)
         if not anchor:
             self.logger.warning("未找到顶部'搜索'按钮，无法定位相机入口")
             return False
@@ -299,14 +356,24 @@ class DouyinCrawler:
         return False
 
     def push_image(self):
-        """把本地待搜索图片推送到手机相册目录。"""
+        """把本地待搜索图片推送到手机相册目录，并确保它在相册最前(最新)。
+
+        相册按图片 mtime 降序排列(最新在最前)。若手机相册里有比 sample.jpg 更新的图，
+        sample.jpg 会被挤到后面、选图点到错图。所以推送前更新本地时间戳为当前、
+        推送后再 touch 设备文件，保证它 mtime 最新、排第一。
+        """
         src = config.CRAWL_CONFIG["search_image_path"]
         if not os.path.isfile(src):
             raise FileNotFoundError(f"待搜索图片不存在: {src}")
         dev_dir = config.APP_CONFIG["device_image_dir"]
         dev_path = dev_dir + os.path.basename(src)
+        os.utime(src, None)  # 本地 mtime 设为当前，push 后设备端继承为最新
         self.logger.info(f"推送图片: {src} -> {dev_path}")
         self.adb.push(src, dev_dir)
+        try:
+            self.adb.shell(f"touch {dev_path}")  # 兜底：强制设备端 mtime 最新
+        except Exception:
+            pass
         self.adb.media_scan(dev_path)
         return dev_path
 
@@ -454,30 +521,48 @@ class DouyinCrawler:
         return {}
 
     def find_params_entry(self, max_scrolls=None):
-        """下滑详情页找「退货包邮券·7天无理由退货」锚点，返回其 OCR item。
+        """下滑详情页用模板匹配找「参数入口图标」，返回其位置 {cx, cy}。
 
-        参数容器(表面参数卡片)紧贴在该锚点正上方，点击卡片可进入完整参数页。
-        用完整锚点「7天无理由」定位，避免「退货包邮券」部分匹配到上方优惠券条。
+        参数入口最左边有个图标(表盘样式)，OCR 读不到文字，用 OpenCV matchTemplate
+        定位——不依赖"退货包邮券"等文字锚点，适配所有商品布局差异。
+        ⚠️ 模板 templates/param_row.png 需与当前设备同分辨率截图裁剪。
         """
         max_scrolls = max_scrolls or config.DETAIL_CONFIG["max_scrolls_find_params"]
+        # 所有 param_icon*.png 模板都试(不同商品图标有颜色/细节/缩放变体，单模板匹配度差)
+        import glob
+        tpls = sorted(glob.glob(os.path.join(self.tmpl.template_dir, "param_icon*.png")))
+        w = self.adb.window_size()["w"]
         for i in range(max_scrolls):
-            items = self._shot_ocr()
-            anchor = self.ocr.find_text(items, ["7天无理由", "无理由退货"])
-            if anchor:
-                self.logger.info(f"第{i+1}屏找到参数锚点 '{anchor['text']}'")
-                return anchor
+            shot = self._shot()
+            # 主方案：表盘图标模板匹配
+            for tpl in tpls:
+                pos = self.tmpl.find(shot, os.path.basename(tpl))
+                if pos:
+                    self.logger.info(f"第{i+1}屏匹配 {os.path.basename(tpl)} @({int(pos[0])},{int(pos[1])})")
+                    return {"cx": pos[0], "cy": pos[1]}
+            # 备用方案：没匹配到表盘图标(少数商品无此图标)，OCR 找表面参数行当入口点击
+            items = self.ocr.recognize(shot)
+            keys = [it for it in items if self._is_param_key(it)]
+            if len(keys) >= 2:
+                cy = int(sum(k["cy"] for k in keys) / len(keys))
+                self.logger.info(f"第{i+1}屏 表盘图标未匹配，改点表面参数行 @(cx{int(w*0.5)},cy{cy})")
+                return {"cx": w * 0.5, "cy": cy}
             self.adb.swipe_up()
             time.sleep(config.CRAWL_CONFIG["settle_seconds"])
-        self.logger.warning(f"滑动 {max_scrolls} 次未找到参数锚点")
+        self.logger.warning(f"滑动 {max_scrolls} 次未匹配到参数入口图标")
         return None
 
     def _is_param_key(self, it):
-        """单项是否像参数 key(含参数名，排除卖点/操作/标签/容器标题)。"""
+        """单项是否像参数 key(含参数名，排除卖点/操作/标签/容器标题/多参数合并摘要)。"""
         t = it["text"]
         if any(kw in t for kw in locators.PARAM_SELLER_WORDS):
             return False
         if any(kw in t for kw in ["客服", "购物车", "下单", "产品参数", "商品参数",
                                     "查看", "领取", "进入", "关闭", "更多", "详情"]):
+            return False
+        # 排除"电压·型号·品牌"这类多个参数名用 ·/| 连接的合并摘要(非单一参数 key)
+        # 及"充气噪音<40dB"这类带 < > 数值描述的卖点
+        if "·" in t or "|" in t or "<" in t or ">" in t:
             return False
         return any(kw in t for kw in locators.PARAM_KEY_HINTS)
 
@@ -519,10 +604,9 @@ class DouyinCrawler:
         anchor = self.find_params_entry()
         if not anchor:
             return {}
-        w = self.adb.window_size()["w"]
-        # 参数容器(表面参数)紧贴锚点正上方约 212px
-        self.logger.info(f"点击参数容器进完整参数页 @({int(w*0.42)},{int(anchor['cy']-212)})")
-        self.adb.tap(w * 0.42, anchor["cy"] - 212)
+        # 点击参数入口图标本身进完整参数页(图标即入口，不再用相对偏移)
+        self.logger.info(f"点击参数入口图标进完整参数页 @({int(anchor['cx'])},{int(anchor['cy'])})")
+        self.adb.tap(anchor["cx"], anchor["cy"])
         time.sleep(config.DETAIL_CONFIG["detail_settle_seconds"])
         params = {}
         for j in range(6):
@@ -676,21 +760,33 @@ class DouyinCrawler:
         prices = self.ocr.find_prices(screen)
         price_cy = prices[0]["cy"] if prices else 2400
         title = self.collect_detail_title(screen, price_cy)
-        origin_price = prices[0]["text"] if prices else price_item["text"]
+        # 原价 = 第一个非"券后/新人价"的价格；券后价 = 第一个含"券后/新人价"
+        origin_price = ""
         coupon_price = ""
         for p in prices:
-            if "券后" in p["text"] or "卷后" in p["text"]:
-                coupon_price = p["text"]
-                break
+            if any(k in p["text"] for k in ["券后", "卷后", "新人价"]):
+                coupon_price = coupon_price or p["text"]
+            else:
+                origin_price = origin_price or p["text"]
+        if not origin_price:
+            origin_price = prices[0]["text"] if prices else price_item["text"]
         shop = ""
-        # 店铺：按优先级(旗舰 > 官方 > 自营/专营/专卖)找，排除"店铺销量"等文案
+        shop_noise = ["销量", "好评", "评价", "客服", "购物", "售后", "人付款"]
+        # 店铺：按优先级(旗舰 > 官方 > 自营/专营/专卖)找，排除销量/好评等文案
         for kw in ["旗舰", "官方", "自营", "专营", "专卖"]:
             for it in screen:
-                if kw in it["text"] and "销量" not in it["text"]:
+                if kw in it["text"] and not any(n in it["text"] for n in shop_noise):
                     shop = it["text"]
                     break
             if shop:
                 break
+        # 第0屏漏店铺时，重新 OCR 一次找(OCR 有随机性，"抖音旗舰/旗舰店"偶尔漏识别)
+        if not shop:
+            for it in self._shot_ocr():
+                if any(kw in it["text"] for kw in ["旗舰", "官方", "自营", "专营", "专卖"]) \
+                        and not any(n in it["text"] for n in shop_noise):
+                    shop = it["text"]
+                    break
         # 进完整参数页(点参数容器)，上滑收集全部参数(键值对)
         params = self.collect_full_params_page()
         self.logger.info(
@@ -754,15 +850,21 @@ class DouyinCrawler:
         self.logger.info("等待拍同款结果 ...")
         self._wait_text(["已找到", "相似", "同款", "商品"] + locators.PRICE_SYMBOLS, timeout=20)
         results = []
-        seen_prices = set()   # 已抓过的价格文本(去重，避免重复进同一商品)
+        seen_prices = set()   # 已抓过的价格(归一化为数字，避免 ¥/￥/券后价 差异导致重复)
         idle_scrolls = 0      # 连续未抓到新商品的下滑次数(防死循环)
         w = self.adb.window_size()["w"]
+
+        def _norm_price(t):
+            """归一化价格文本：提取数字，忽略 ¥/￥/券后价/新人价/起 等差异。"""
+            m = re.search(r"[\d.]+", t)
+            return m.group(0) if m else t.strip()
+
         while len(results) < max_goods and idle_scrolls < 4:
             items = self._shot_ocr()
             all_prices = self.ocr.find_prices(items)
-            # 只点左半屏商品：直播入口在卡片右下角，点右半易进直播间而非商品详情
-            prices = [p for p in all_prices if p["cx"] < w * 0.5]
-            p = next((x for x in prices if x["text"] not in seen_prices), None)
+            # 只点左半屏商品(避开右下直播入口)，cx>50 排除屏幕左边缘误识别
+            prices = [p for p in all_prices if 50 < p["cx"] < w * 0.5]
+            p = next((x for x in prices if _norm_price(x["text"]) not in seen_prices), None)
             self.logger.info(
                 f"列表扫描: 识别价格{len(all_prices)}个(左半屏{len(prices)}个) "
                 f"{[x['text'] + '@cx' + str(int(x['cx'])) for x in all_prices]} | "
@@ -774,7 +876,7 @@ class DouyinCrawler:
                 time.sleep(config.CRAWL_CONFIG["settle_seconds"])
                 idle_scrolls += 1
                 continue
-            seen_prices.add(p["text"])
+            seen_prices.add(_norm_price(p["text"]))
             self.logger.info(f"=== 第 {len(results)+1}/{max_goods} 个商品: {p['text']} ===")
             try:
                 results.append(self.collect_detail(p))

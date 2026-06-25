@@ -108,7 +108,15 @@ def save_excel(goods):
     for col, width in zip("ABCDEF", [6, 42, 12, 14, 16, 52]):
         ws.column_dimensions[col].width = width
     path = os.path.join(config.OUTPUT_CONFIG["output_dir"], config.OUTPUT_CONFIG["excel_file"])
-    wb.save(path)
+    try:
+        wb.save(path)
+    except PermissionError:
+        # 文件被占用(Excel 打开着)，改用带时间戳的备选文件名，避免整个程序崩
+        import time as _t
+        path = os.path.join(config.OUTPUT_CONFIG["output_dir"],
+                            f"douyin_results_{_t.strftime('%Y%m%d_%H%M%S')}.xlsx")
+        wb.save(path)
+        print("[警告] douyin_results.xlsx 被占用(请关闭 Excel)，已存到带时间戳的备选文件")
     print(f"[保存] Excel: {path}")
 
 

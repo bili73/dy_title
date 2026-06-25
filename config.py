@@ -20,7 +20,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # ==============================================================================
 ADB_CONFIG = {
     "adb_path": r"D:\Android\platform-tools\adb.exe",   # adb 绝对路径（已确认）
-    "udid": "10AG5603GY007KL",                          # 设备序列号（adb devices 查到）
+    "udid": "1551169392ZZZZZ",                          # 设备序列号（vivo V2136A）
     "device_screenshot": "/sdcard/dy_shot.png",         # 设备端临时截图文件
     "cmd_timeout": 30,                                  # 单条 adb 命令超时(秒)
 }
@@ -105,5 +105,16 @@ OUTPUT_CONFIG = {
 TEMPLATE_CONFIG = {
     # 小图标模板图片放此目录，命名如 camera.png / search.png / back.png
     "template_dir": os.path.join(BASE_DIR, "templates"),
-    "match_threshold": 0.75,              # OpenCV matchTemplate 阈值(0~1，越大越严)
+    "match_threshold": 0.60,             # OpenCV matchTemplate 阈值(0~1，越大越严)
+}
+
+
+# ==============================================================================
+# 6. OCR 服务(PaddleOCR PP-OCRv6，docker 部署)
+# ==============================================================================
+# POST multipart field 'file'=<image>，返回 {count, text, lines:[{text, box, score}]}
+# box 为 4 个角点 [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]，用于算文字中心坐标驱动点击/配对。
+OCR_CONFIG = {
+    "paddleocr_url": "http://localhost:9300/ocr",
+    "timeout": 120,                      # 单次 OCR 请求超时(秒)；PaddleOCR CPU 推理较慢
 }
