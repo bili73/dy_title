@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<!--
+  web/static/index.html
+  ================================================================================================
+  抖音抓取控制台前端（单页，原生 fetch + EventSource/SSE，零构建）。
+  左栏：上传识别图片 / 选模式 / 设 Excel 目录 / 开始抓取。
+  右栏：实时日志流 + 最新截图预览 + 结果下载。
+  风格：中性灰底 + 抖音红 #fe2c55 强调，不堆蓝紫渐变。
+  ================================================================================================
+-->
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>抖音拍同款抓取控制台</title>
+  <style>
+    :root {
+      --bg: #f5f5f7;
+      --panel: #ffffff;
+      --text: #1d1d1f;
+      --muted: #86868b;
+      --border: #e5e5e7;
+      --accent: #fe2c55;        /* 抖音红，强调/主按钮 */
+      --accent-dark: #e51e4a;
+      --info: #6e6e73;
+      --warn: #c47b00;
+      --error: #d32f2f;
+      --ok: #2e7d32;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 14px;
+    }
+    header {
+      padding: 14px 20px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    header .logo {
+      width: 28px; height: 28px; border-radius: 6px;
+      background: var(--accent);
+      display: flex; align-items: center; justify-content: center;
+      color: #fff; font-weight: 700;
+    }
+    header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+    header .sub { color: var(--muted); font-size: 12px; }
+
+    .app {
+      display: grid;
+      grid-template-columns: 380px 1fr;
+      gap: 16px;
+      padding: 16px;
+      max-width: 1400px;
+      margin: 0 auto;
+    }
+    @media (max-width: 960px) { .app { grid-template-columns: 1fr; } }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+    }
+    .panel h2 {
+      font-size: 13px; margin: 0 0 12px 0; color: var(--muted);
+      text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600;
+    }
+    .field { margin-bottom: 14px; }
+    .field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+    input[type=text], input[type=number], select {
+      width: 100%; padding: 8px 10px; border: 1px solid var(--border);
+      border-radius: 8px; font-size: 13px; background: #fafafa;
+    }
+    input:focus, select:focus { outline: none; border-color: var(--accent); background: #fff; }
+
+    /* 图片上传区 */
+    .drop {
+      border: 2px dashed var(--border); border-radius: 10px;
+      padding: 16px; text-align: center; cursor: pointer;
+      color: var(--muted); transition: all .15s; background: #fafafa;
+    }
+    .drop:hover, .drop.drag { border-color: var(--accent); color: var(--accent); background: #fff5f7; }
+    .drop input { display: none; }
+    .preview {
+      margin-top: 10px; width: 100%; max-height: 180px; object-fit: contain;
+      border-radius: 8px; background: #fafafa; display: none;
+    }
+    .preview.show { display: block; }
+
+    /* 模式切换 */
+    .seg { display: flex; gap: 6px; }
+    .seg button {
+      flex: 1; padding: 8px; border: 1px solid var(--border); background: #fafafa;
+      border-radius: 8px; cursor: pointer; font-size: 13px; color: var(--text);
+    }
+    .seg button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+    /* 主按钮 */
+    .btn {
+      width: 100%; padding: 11px; border: none; border-radius: 8px;
+      background: var(--accent); color: #fff; font-size: 14px; font-weight: 600;
+      cursor: pointer; transition: background .15s;
+    }
+    .btn:hover { background: var(--accent-dark); }
+    .btn:disabled { background: #c7c7cc; cursor: not-allowed; }
+    .btn.ghost { background: #fff; color: var(--text); border: 1px solid var(--border); }
+    .btn.ghost:hover { background: #f5f5f7; }
+
+    /* 状态徽标 */
+    .badge {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 600;
+      background: #f0f0f2; color: var(--muted);
+    }
+    .badge .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+    .badge.idle { color: var(--muted); }
+    .badge.running { color: var(--accent); }
+    .badge.done { color: var(--ok); }
+    .badge.error { color: var(--error); }
+
+    .monitor-head {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 12px;
+    }
+    .shot-wrap {
+      background: #1d1d1f; border-radius: 8px; text-align: center;
+      margin-bottom: 12px; min-height: 120px; display: flex; align-items: center; justify-content: center;
+    }
+    .shot-wrap img { max-width: 100%; max-height: 260px; border-radius: 8px; display: none; }
+    .shot-wrap img.show { display: block; }
+    .shot-wrap .ph { color: #86868b; font-size: 12px; }
+
+    /* 日志流 */
+    .logs {
+      background: #1d1d1f; color: #e8e8ea; border-radius: 8px;
+      padding: 10px; font-family: "Consolas", "Menlo", monospace;
+      font-size: 12px; line-height: 1.6; height: 360px; overflow-y: auto;
+      white-space: pre-wrap; word-break: break-all;
+    }
+    .logs .lv-WARNING { color: #ffb340; }
+    .logs .lv-ERROR { color: #ff6b6b; }
+    .logs .lv-INFO { color: #c7c7cf; }
+    .logs .ts { color: #6e6e73; margin-right: 6px; }
+    .logs .sys { color: #4fc3f7; }   /* 系统事件（状态/截图）高亮 */
+
+    .downloads { display: none; margin-top: 12px; gap: 8px; }
+    .downloads.show { display: flex; }
+    .downloads .btn { width: auto; flex: 1; padding: 8px; font-size: 13px; }
+
+    .toast {
+      position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+      background: #1d1d1f; color: #fff; padding: 10px 18px; border-radius: 8px;
+      font-size: 13px; box-shadow: 0 4px 16px rgba(0,0,0,.2); display: none; z-index: 99;
+    }
+    .toast.show { display: block; }
+    .hint { font-size: 11px; color: var(--muted); margin-top: 4px; }
+
+    /* 目录选择器弹层 */
+    .modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.4);
+             align-items: center; justify-content: center; z-index: 100; }
+    .modal.show { display: flex; }
+    .modal-box { background: var(--panel); border-radius: 12px; width: 480px; max-width: 92vw;
+                 max-height: 80vh; display: flex; flex-direction: column;
+                 box-shadow: 0 8px 32px rgba(0,0,0,.2); }
+    .modal-head { display: flex; justify-content: space-between; align-items: center;
+                  padding: 12px 16px; border-bottom: 1px solid var(--border); }
+    .modal-head h2 { font-size: 14px; }
+    .modal-head .x { border: none; background: none; font-size: 22px; cursor: pointer; color: var(--muted); line-height: 1; }
+    .modal-path { padding: 8px 16px; font-family: "Consolas", monospace; font-size: 12px;
+                  color: var(--muted); background: #fafafa; border-bottom: 1px solid var(--border);
+                  word-break: break-all; }
+    .dir-list { flex: 1; overflow-y: auto; padding: 6px 0; }
+    .dir-item { padding: 8px 16px; cursor: pointer; }
+    .dir-item:hover { background: #fff5f7; color: var(--accent); }
+    .modal-foot { display: flex; gap: 8px; justify-content: flex-end;
+                  padding: 12px 16px; border-top: 1px solid var(--border); }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="logo">拍</div>
+    <div>
+      <h1>抖音拍同款抓取控制台</h1>
+      <div class="sub">adb + OCR · 本地控制台</div>
+    </div>
+    <div style="margin-left:auto" id="globalBadge">
+      <span class="badge idle"><span class="dot"></span><span id="stateText">待机</span></span>
+    </div>
+  </header>
+
+  <div class="app">
+    <!-- 左栏：配置 -->
+    <section class="panel">
+      <h2>配置</h2>
+
+      <div class="field">
+        <label>识别图片</label>
+        <label class="drop" id="dropZone">
+          <div id="dropText">📷 点击或拖拽上传图片</div>
+          <input type="file" id="fileInput" accept="image/*" />
+        </label>
+        <img class="preview" id="preview" alt="预览" />
+      </div>
+
+      <div class="field">
+        <label>抓取模式</label>
+        <div class="seg" id="modeSeg">
+          <button data-mode="list" class="active">只抓列表</button>
+          <button data-mode="detail">进详情抓参数</button>
+        </div>
+      </div>
+
+      <div class="field" id="maxGoodsField" style="display:none">
+        <label>详情商品数量（max-goods）</label>
+        <input type="number" id="maxGoods" value="3" min="1" max="20" />
+      </div>
+
+      <div class="field">
+        <label>Excel / 结果保存目录</label>
+        <div style="display:flex;gap:6px">
+          <input type="text" id="excelDir" value="output" style="flex:1" />
+          <button type="button" class="btn ghost" id="browseBtn" style="width:auto;padding:8px 14px">浏览…</button>
+        </div>
+        <div class="hint">可手输，或点「浏览…」图形化选本地目录；默认 output/。</div>
+      </div>
+
+      <button class="btn" id="startBtn" disabled>开始抓取</button>
+    </section>
+
+    <!-- 右栏：监控 -->
+    <section class="panel">
+      <div class="monitor-head">
+        <h2 style="margin:0">实时监控</h2>
+        <span class="badge idle" id="runBadge"><span class="dot"></span><span id="runText">待机</span></span>
+      </div>
+
+      <div class="shot-wrap">
+        <img id="shot" alt="最新截图" />
+        <span class="ph" id="shotPh">抓取运行时此处显示最新截图</span>
+      </div>
+
+      <div class="logs" id="logs"></div>
+
+      <div class="downloads" id="downloads">
+        <a class="btn ghost" href="/api/download?file=excel" download>下载 Excel</a>
+        <a class="btn ghost" href="/api/download?file=json" download>下载 JSON</a>
+        <a class="btn ghost" href="/api/download?file=txt" download>下载 TXT</a>
+      </div>
+    </section>
+  </div>
+
+  <!-- 目录选择器弹层 -->
+  <div class="modal" id="dirModal">
+    <div class="modal-box">
+      <div class="modal-head">
+        <h2>选择保存目录</h2>
+        <button type="button" class="x" id="dirClose">×</button>
+      </div>
+      <div class="modal-path" id="dirPath">—</div>
+      <div class="dir-list" id="dirList"></div>
+      <div class="modal-foot">
+        <button type="button" class="btn ghost" id="dirUp" style="width:auto;padding:8px 14px">↑ 上一级</button>
+        <button type="button" class="btn" id="dirPick" style="width:auto;padding:8px 14px">选择此目录</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    // ---- DOM ----
+    const $ = (id) => document.getElementById(id);
+    const dropZone = $("dropZone"), fileInput = $("fileInput"), dropText = $("dropText");
+    const preview = $("preview"), startBtn = $("startBtn");
+    const modeSeg = $("modeSeg"), maxGoodsField = $("maxGoodsField");
+    const excelDir = $("excelDir"), maxGoods = $("maxGoods");
+    const logs = $("logs"), shot = $("shot"), shotPh = $("shotPh");
+    const downloads = $("downloads");
+    const stateText = $("stateText"), runText = $("runText");
+    const globalBadge = $("globalBadge"), runBadge = $("runBadge");
+    const toast = $("toast");
+
+    let currentImage = null;   // 已上传图片的服务端路径
+    let mode = "list";
+
+    // ---- 工具 ----
+    function showToast(msg, ms = 2500) {
+      toast.textContent = msg; toast.classList.add("show");
+      clearTimeout(showToast._t);
+      showToast._t = setTimeout(() => toast.classList.remove("show"), ms);
+    }
+
+    function setStateBadge(state, label) {
+      const txt = label || { idle: "待机", running: "抓取中…", done: "完成", error: "出错" }[state] || state;
+      stateText.textContent = txt; runText.textContent = txt;
+      [globalBadge.querySelector(".badge"), runBadge].forEach(b => {
+        b.className = "badge " + state;
+      });
+    }
+
+    function appendLog(line, cls) {
+      const div = document.createElement("div");
+      if (cls) div.className = cls;
+      div.textContent = line;
+      logs.appendChild(div);
+      // 限制最多 600 行，超出删旧行
+      while (logs.childElementCount > 600) logs.removeChild(logs.firstChild);
+      // 自动滚到底（仅当用户已在底部附近）
+      const nearBottom = logs.scrollHeight - logs.scrollTop - logs.clientHeight < 60;
+      if (nearBottom) logs.scrollTop = logs.scrollHeight;
+    }
+
+    function fmtTs(ts) {
+      const d = new Date(ts * 1000);
+      return d.toLocaleTimeString("zh-CN", { hour12: false });
+    }
+
+    // ---- 图片上传 ----
+    async function uploadFile(file) {
+      if (!file || !file.type.startsWith("image/")) {
+        showToast("请选择图片文件"); return;
+      }
+      const fd = new FormData();
+      fd.append("file", file);
+      try {
+        startBtn.disabled = true;
+        const r = await fetch("/api/image", { method: "POST", body: fd });
+        if (!r.ok) {
+          const e = await r.json().catch(() => ({}));
+          showToast("上传失败: " + (e.detail || r.status)); return;
+        }
+        const data = await r.json();
+        currentImage = data.path;
+        preview.src = data.preview_url;
+        preview.classList.add("show");
+        dropText.textContent = "✅ 已上传（点击可更换）";
+        startBtn.disabled = false;
+      } catch (e) {
+        showToast("上传出错: " + e.message);
+      }
+    }
+
+    fileInput.addEventListener("change", (e) => {
+      if (e.target.files[0]) uploadFile(e.target.files[0]);
+    });
+    ["dragenter", "dragover"].forEach(ev =>
+      dropZone.addEventListener(ev, (e) => { e.preventDefault(); dropZone.classList.add("drag"); }));
+    ["dragleave", "drop"].forEach(ev =>
+      dropZone.addEventListener(ev, (e) => { e.preventDefault(); dropZone.classList.remove("drag"); }));
+    dropZone.addEventListener("drop", (e) => {
+      const f = e.dataTransfer.files[0];
+      if (f) uploadFile(f);
+    });
+
+    // ---- 模式切换 ----
+    modeSeg.querySelectorAll("button").forEach(b => {
+      b.addEventListener("click", () => {
+        modeSeg.querySelectorAll("button").forEach(x => x.classList.remove("active"));
+        b.classList.add("active");
+        mode = b.dataset.mode;
+        maxGoodsField.style.display = (mode === "detail") ? "block" : "none";
+      });
+    });
+
+    // ---- 启动抓取 ----
+    startBtn.addEventListener("click", async () => {
+      if (!currentImage) { showToast("请先上传识别图片"); return; }
+      const body = {
+        mode,
+        max_goods: parseInt(maxGoods.value, 10) || 3,
+        excel_dir: excelDir.value.trim() || "output",
+        image_path: currentImage,
+      };
+      try {
+        const r = await fetch("/api/start", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!r.ok) {
+          const e = await r.json().catch(() => ({}));
+          showToast("启动失败: " + (e.detail || r.status)); return;
+        }
+        appendLog("▶ 启动抓取（" + mode + (mode === "detail" ? ", max=" + body.max_goods : "") + "）", "sys");
+        startBtn.disabled = true;
+        downloads.classList.remove("show");
+      } catch (e) {
+        showToast("启动出错: " + e.message);
+      }
+    });
+
+    // ---- 目录选择器 ----
+    const dirModal = $("dirModal"), dirListEl = $("dirList"), dirPathEl = $("dirPath");
+    async function loadDir(d) {
+      try {
+        const url = "/api/fs/list" + (d ? ("?dir=" + encodeURIComponent(d)) : "");
+        const r = await fetch(url);
+        if (!r.ok) { const e = await r.json().catch(() => ({})); showToast("读取失败: " + (e.detail || r.status)); return; }
+        const data = await r.json();
+        dirPathEl.textContent = data.current || "（我的电脑 — 选一个盘符）";
+        dirModal.dataset.current = data.current || "";
+        dirModal.dataset.parent = data.parent || "";
+        dirListEl.innerHTML = "";
+        data.dirs.forEach(n => {
+          const div = document.createElement("div");
+          div.className = "dir-item";
+          div.textContent = (data.is_root ? "💾 " : "📁 ") + n;
+          // 双击进入：根目录 n 是盘符(如 D:\)；否则拼当前目录 + 子目录名
+          div.ondblclick = () => loadDir(data.is_root ? n : (data.current.replace(/[\\/]+$/, "") + "\\" + n));
+          dirListEl.appendChild(div);
+        });
+      } catch (e) { showToast("读取目录出错: " + e.message); }
+    }
+    $("browseBtn").onclick = async () => {
+      // 从当前值开始；若为相对路径(无盘符)则从盘符根开始
+      let start = $("excelDir").value.trim();
+      if (start && !/[A-Za-z]:[\\/]/.test(start)) start = "";
+      await loadDir(start);
+      dirModal.classList.add("show");
+    };
+    $("dirClose").onclick = () => dirModal.classList.remove("show");
+    $("dirUp").onclick = () => { const p = dirModal.dataset.parent; loadDir(p || ""); };
+    $("dirPick").onclick = () => {
+      const cur = dirModal.dataset.current;
+      if (cur) { $("excelDir").value = cur; showToast("已选: " + cur, 1500); }
+      dirModal.classList.remove("show");
+    };
+    dirModal.onclick = (e) => { if (e.target === dirModal) dirModal.classList.remove("show"); };
+
+    // ---- SSE 事件流 ----
+    function connectSSE() {
+      const es = new EventSource("/api/events");
+      es.onmessage = (e) => {
+        let ev;
+        try { ev = JSON.parse(e.data); } catch (_) { return; }
+        if (ev.type === "log") {
+          appendLog(`[${fmtTs(ev.ts)}] ${ev.level.padEnd(7)} ${ev.msg}`, "lv-" + ev.level);
+        } else if (ev.type === "status") {
+          setStateBadge(ev.state);
+          if (ev.state === "running") {
+            startBtn.disabled = true;
+          } else if (ev.state === "done") {
+            appendLog(`✅ 抓取完成，共 ${ev.goods_count ?? 0} 件商品`, "sys");
+            if (ev.goods_count > 0) downloads.classList.add("show");
+            startBtn.disabled = false;
+          } else if (ev.state === "error") {
+            appendLog("❌ 抓取失败: " + (ev.error || "未知错误"), "lv-ERROR");
+            startBtn.disabled = false;
+          } else if (ev.state === "idle") {
+            startBtn.disabled = !currentImage;
+          }
+        } else if (ev.type === "shot") {
+          shot.src = ev.url;
+          shot.classList.add("show");
+          shotPh.style.display = "none";
+        }
+      };
+      es.onerror = () => {
+        // EventSource 会自动重连，这里只打个提示
+        appendLog("[连接] SSE 断开，自动重连中…", "sys");
+      };
+    }
+    connectSSE();
+
+    // 初始状态
+    setStateBadge("idle");
+  </script>
+</body>
+</html>

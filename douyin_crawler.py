@@ -37,7 +37,10 @@ class AdbController:
 
     def __init__(self, adb_path, udid):
         self.adb = adb_path
-        self.udid = udid
+        self.logger = logging.getLogger("AdbController")
+        self._dpi = None  # 懒加载缓存：首次 dpi() 调用时解析 wm density
+        # udid 为 "auto"/None 时自动识别在线设备；否则用传入的写死序列号
+        self.udid = self._resolve_udid() if udid in (None, "auto") else udid
 
     def _run(self, args, timeout=None):
         """执行 adb 命令，返回 (code, stdout_bytes, stderr_bytes)。"""
@@ -92,6 +95,57 @@ class AdbController:
         if m:
             return {"w": int(m.group(1)), "h": int(m.group(2))}
         return {"w": 1080, "h": 2400}
+
+    def _resolve_udid(self):
+        """自动识别在线设备序列号：`adb devices` 取第一个 state=device 的设备。
+
+        config.ADB_CONFIG["udid"]="auto" 时调用。裸跑 `adb devices`（此时还没 udid，
+        不能带 -s，故不经 _run）。0 个在线设备抛错；多设备取第一个并告警，提示在
+        config 写死具体序列号。
+        """
+        r = subprocess.run([self.adb, "devices"], capture_output=True,
+                           timeout=config.ADB_CONFIG["cmd_timeout"])
+        out = r.stdout.decode("utf-8", errors="ignore")
+        devs = []
+        for line in out.splitlines():
+            m = re.match(r"^(?P<sn>\S+)\s+(?P<state>device|offline|unauthorized)", line)
+            if m and m.group("state") == "device":
+                devs.append(m.group("sn"))
+        if not devs:
+            raise RuntimeError("adb devices 无在线设备，请检查 USB 连接/调试/授权")
+        if len(devs) > 1:
+            self.logger.warning(
+                f"检测到多个设备 {devs}，使用第一个 '{devs[0]}'；"
+                f"如需指定请在 config.ADB_CONFIG['udid'] 写死序列号"
+            )
+        return devs[0]
+
+    def dpi(self):
+        """返回设备 dpi（px/inch），懒加载缓存。
+
+        解析 `adb shell wm density`，Override density 优先（用户改过的实际生效值），
+        否则取 Physical density。解析失败回退 480（= 基准设备值，保证读不到 dpi 时
+        行为不退化）并告警，不静默。
+        """
+        if self._dpi is not None:
+            return self._dpi
+        out = self.shell("wm density")
+        m = (re.search(r"Override\s+density:?\s*(\d+)", out)
+             or re.search(r"Physical\s+density:?\s*(\d+)", out))
+        if m:
+            self._dpi = int(m.group(1))
+        else:
+            self._dpi = 480
+            self.logger.warning("无法读取 wm density，按 480dpi 换算 dp，请确认设备连接")
+        return self._dpi
+
+    def dp(self, n):
+        """dp（density-independent pixel）转 px：px = round(n * dpi / 160)。
+
+        Android 标准 dp 定义。所有坐标偏移/配对容差用 dp 表达，调用本方法按设备实际
+        dpi 换算，实现跨分辨率/DPI 适配。基准 480dpi 下 1dp=3px。
+        """
+        return round(n * self.dpi() / 160.0)
 
     def am_start(self, component):
         """启动指定组件（package/activity 或 package/activity 全称）。"""
@@ -223,7 +277,12 @@ class TemplateMatcher:
         return cv2.imdecode(np.fromfile(path, dtype=np.uint8), -1)
 
     def find(self, screenshot_path, template_name):
-        """在截图中找模板 template_name，返回 (cx, cy) 或 None。"""
+        """在截图中找模板 template_name，返回 (cx, cy) 或 None。
+
+        多尺度匹配：模板按屏宽比例主缩放 + ±10% 窄范围兜底，适配不同分辨率/DPI 设备
+        （模板按 1080 宽裁剪，换机后图标物理大小随屏宽变化）。缩模板不缩 scene；scene
+        的 Canny 边缘只算一次，每个尺度仅重算模板边缘 + matchTemplate，取全局最高分。
+        """
         tpl_path = os.path.join(self.template_dir, template_name)
         if not os.path.exists(tpl_path):
             self.logger.warning(f"模板不存在: {tpl_path}")
@@ -238,16 +297,71 @@ class TemplateMatcher:
             scene = cv2.cvtColor(scene, cv2.COLOR_BGRA2BGR)
         if tpl.ndim == 3 and tpl.shape[2] == 4:
             tpl = cv2.cvtColor(tpl, cv2.COLOR_BGRA2BGR)
-        # 用 Canny 边缘匹配(抗颜色/亮度/缩放差异，比直接匹配更适合图标定位)
+        # 多尺度：按屏宽算主缩放因子(模板按 1080 宽裁)，±10% 兜底覆盖裁剪/渲染误差
+        scale_base = scene.shape[1] / 1080.0
+        scales = [scale_base * f for f in (0.9, 1.0, 1.1)]
         scene_edge = cv2.Canny(cv2.cvtColor(scene, cv2.COLOR_BGR2GRAY), 50, 150)
-        tpl_edge = cv2.Canny(cv2.cvtColor(tpl, cv2.COLOR_BGR2GRAY), 50, 150)
-        res = cv2.matchTemplate(scene_edge, tpl_edge, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, max_loc = cv2.minMaxLoc(res)
-        if max_val < self.threshold:
-            self.logger.info(f"匹配 {template_name} 最高相似度 {max_val:.3f} < 阈值 {self.threshold}")
+        best_val, best_loc, best_hw = -1.0, None, tpl.shape[:2]
+        for s in scales:
+            if s <= 0:
+                continue
+            t = cv2.resize(tpl, None, fx=s, fy=s)  # 缩模板不缩 scene
+            # 模板比 scene 还大则跳过(matchTemplate 要求模板 ≤ scene，否则报错)
+            if t.shape[0] > scene.shape[0] or t.shape[1] > scene.shape[1]:
+                continue
+            tpl_edge = cv2.Canny(cv2.cvtColor(t, cv2.COLOR_BGR2GRAY), 50, 150)
+            res = cv2.matchTemplate(scene_edge, tpl_edge, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(res)
+            if max_val > best_val:
+                best_val, best_loc, best_hw = max_val, max_loc, t.shape[:2]
+        if best_loc is None or best_val < self.threshold:
+            self.logger.info(
+                f"匹配 {template_name} 最高相似度 {best_val:.3f} < 阈值 {self.threshold}"
+            )
             return None
-        h, w = tpl.shape[:2]
-        return (max_loc[0] + w / 2, max_loc[1] + h / 2)
+        h, w = best_hw
+        return (best_loc[0] + w / 2, best_loc[1] + h / 2)
+
+    def find_all(self, screenshot_path, template_name, topn=4):
+        """返回多个匹配位置 [(cx, cy, score)]，按相似度降序，NMS 去邻近重复。
+
+        详情页参数入口图标与下部推荐区图标同款，最高峰可能误匹配推荐区。取 topn 个峰，
+        配合点击后验证，逐个试到真正进完整参数页的那个。
+        """
+        tpl_path = os.path.join(self.template_dir, template_name)
+        if not os.path.exists(tpl_path):
+            return []
+        scene = self._imread(screenshot_path)
+        tpl = self._imread(tpl_path)
+        if scene is None or tpl is None:
+            return []
+        if scene.ndim == 3 and scene.shape[2] == 4:
+            scene = cv2.cvtColor(scene, cv2.COLOR_BGRA2BGR)
+        if tpl.ndim == 3 and tpl.shape[2] == 4:
+            tpl = cv2.cvtColor(tpl, cv2.COLOR_BGRA2BGR)
+        # 主尺度(按屏宽)做 matchTemplate，取 topn 峰值
+        scale = scene.shape[1] / 1080.0
+        t = cv2.resize(tpl, None, fx=scale, fy=scale)
+        if t.shape[0] > scene.shape[0] or t.shape[1] > scene.shape[1]:
+            return []
+        scene_edge = cv2.Canny(cv2.cvtColor(scene, cv2.COLOR_BGR2GRAY), 50, 150)
+        tpl_edge = cv2.Canny(cv2.cvtColor(t, cv2.COLOR_BGR2GRAY), 50, 150)
+        res = cv2.matchTemplate(scene_edge, tpl_edge, cv2.TM_CCOEFF_NORMED)
+        h, w = t.shape[:2]
+        out = []
+        res_copy = res.copy()
+        for _ in range(topn):
+            _, max_val, _, max_loc = cv2.minMaxLoc(res_copy)
+            if max_val < self.threshold:
+                break
+            out.append((max_loc[0] + w / 2, max_loc[1] + h / 2, float(max_val)))
+            # NMS：掩盖该峰附近，避免重复取同一目标
+            x0 = max(0, max_loc[0] - w)
+            x1 = min(res_copy.shape[1], max_loc[0] + 2 * w)
+            y0 = max(0, max_loc[1] - h)
+            y1 = min(res_copy.shape[0], max_loc[1] + 2 * h)
+            res_copy[y0:y1, x0:x1] = 0
+        return out
 
 
 # ==============================================================================
@@ -256,12 +370,16 @@ class TemplateMatcher:
 class DouyinCrawler:
     """抖音商城拍同款抓取主流程。"""
 
-    def __init__(self):
+    def __init__(self, search_image_path=None):
         self.adb = AdbController(config.ADB_CONFIG["adb_path"], config.ADB_CONFIG["udid"])
         self.ocr = OcrLocator()
         self.tmpl = TemplateMatcher(config.TEMPLATE_CONFIG["template_dir"])
         self._shot_counter = 0
+        # 待搜索图片路径：传入则用传入(前端覆盖)，否则用 config 默认
+        self.search_image_path = search_image_path or config.CRAWL_CONFIG["search_image_path"]
         self._setup_logging()
+        # 把 config 里的 dp 阈值按设备 dpi 换算成 px 缓存（dpi 仅在此解析一次）
+        self._cache_dp_thresholds()
 
     def _setup_logging(self):
         self.logger = logging.getLogger("DouyinCrawler")
@@ -272,6 +390,38 @@ class DouyinCrawler:
             h = logging.StreamHandler()
             h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
             self.logger.addHandler(h)
+
+    def _cache_dp_thresholds(self):
+        """把 config 里的 dp 阈值按设备 dpi 换算成 px，缓存到 self._px。
+
+        dp 值集中定义在 config（DETAIL_CONFIG 的坐标字段 + LIST_OFFSETS_DP），运行时
+        一次性换算成 px 存到 self._px。后续 collect_params / collect_detail_title /
+        collect_goods / enter_scan 直接读 self._px，零运行时 adb 调用（dpi 仅在此解析
+        一次）。与坐标无关的阈值（param_min_items_per_row / title_min_chars）不缓存，
+        仍直接读 config。
+        """
+        dp = self.adb.dp
+        cfg = config.DETAIL_CONFIG
+        off = config.LIST_OFFSETS_DP
+        self._px = {
+            "param_row_dy": (dp(cfg["param_row_dy"][0]), dp(cfg["param_row_dy"][1])),
+            "param_row_cy_tol": dp(cfg["param_row_cy_tol"]),
+            "param_cx_tol": dp(cfg["param_cx_tol"]),
+            "title_search_dy": (dp(cfg["title_search_dy"][0]), dp(cfg["title_search_dy"][1])),
+            "title_merge_dy": dp(cfg["title_merge_dy"]),
+            "camera_left": dp(off["camera_left"]),
+            "title_above_dy": dp(off["title_above_dy"]),
+            "title_right_dx": dp(off["title_right_dx"]),
+            "shop_cy_tol": dp(off["shop_cy_tol"]),
+            # 完整参数页 key-value 配对容差
+            "full_kv_same_row_dy": dp(cfg["full_kv_same_row_dy"]),
+            "full_kv_same_row_dx": (dp(cfg["full_kv_same_row_dx"][0]), dp(cfg["full_kv_same_row_dx"][1])),
+            "full_kv_above_dy": (dp(cfg["full_kv_above_dy"][0]), dp(cfg["full_kv_above_dy"][1])),
+            "full_kv_above_dx": dp(cfg["full_kv_above_dx"]),
+        }
+        self.logger.info(
+            f"设备 dpi={self.adb.dpi()} → 坐标阈值已按 dp 换算 px: {self._px}"
+        )
 
     # ---------- 基础工具 ----------
     def _shot(self):
@@ -328,7 +478,7 @@ class DouyinCrawler:
         """进入拍同款：在 livelite 首页点搜索框右侧的相机图标。
 
         ScanCommodityActivity 无法从外部 am start（会回桌面），必须走 UI。
-        策略：OCR 找顶部「搜索」按钮作锚点 → 相机在其左侧约 90px → 点击 → 验证出现「相册/识别」。
+        策略：OCR 找顶部「搜索」按钮作锚点 → 相机在其左侧约 30dp(基准 480dpi 下≈90px) → 点击 → 验证出现「相册/识别」。
         （已真机验证：搜索按钮 cx≈1289，相机 ≈ left-90 = 1141，点击后进入拍同款页）
         """
         # 等首页加载 + 找"搜索"按钮：取最右侧的(真正的搜索按钮，排除左侧搜索框占位文字)
@@ -344,7 +494,7 @@ class DouyinCrawler:
         if not anchor:
             self.logger.warning("未找到顶部'搜索'按钮，无法定位相机入口")
             return False
-        cam_x = anchor["left"] - 90
+        cam_x = anchor["left"] - self._px["camera_left"]
         cam_y = anchor["cy"]
         self.logger.info(f"点击相机图标 @({int(cam_x)},{int(cam_y)})")
         self.adb.tap(cam_x, cam_y)
@@ -362,7 +512,7 @@ class DouyinCrawler:
         sample.jpg 会被挤到后面、选图点到错图。所以推送前更新本地时间戳为当前、
         推送后再 touch 设备文件，保证它 mtime 最新、排第一。
         """
-        src = config.CRAWL_CONFIG["search_image_path"]
+        src = self.search_image_path
         if not os.path.isfile(src):
             raise FileNotFoundError(f"待搜索图片不存在: {src}")
         dev_dir = config.APP_CONFIG["device_image_dir"]
@@ -415,7 +565,7 @@ class DouyinCrawler:
             for it in items:
                 if it is price_it:
                     continue
-                if it["bottom"] <= price_it["top"] + 20 and it["cx"] < price_it["right"] + 200:
+                if it["bottom"] <= price_it["top"] + self._px["title_above_dy"] and it["cx"] < price_it["right"] + self._px["title_right_dx"]:
                     # 在价格上方区域
                     if len(it["text"]) > len(title):
                         title = it["text"]
@@ -427,7 +577,7 @@ class DouyinCrawler:
             shop = ""
             for it in items:
                 if any(kw in it["text"] for kw in locators.SHOP_KEYWORDS):
-                    if abs(it["cy"] - price_it["cy"]) < 300:
+                    if abs(it["cy"] - price_it["cy"]) < self._px["shop_cy_tol"]:
                         shop = it["text"]
                         break
             goods.append({
@@ -576,6 +726,11 @@ class DouyinCrawler:
         keys = [it for it in items if self._is_param_key(it)]
         params = {}
         used = set()
+        # 配对容差(已按设备 dpi 换算 px，来自 DETAIL_CONFIG 的 full_kv_* 字段，单位原为 dp)
+        sr_dy = self._px["full_kv_same_row_dy"]
+        sr_dx_lo, sr_dx_hi = self._px["full_kv_same_row_dx"]
+        ab_dy_lo, ab_dy_hi = self._px["full_kv_above_dy"]
+        ab_dx = self._px["full_kv_above_dx"]
         for k in keys:
             cands = []
             for v in items:
@@ -585,9 +740,9 @@ class DouyinCrawler:
                     continue
                 dcy = v["cy"] - k["cy"]
                 dcx = v["cx"] - k["cx"]
-                if abs(dcy) < 45 and 50 < dcx < 800:        # 同行右侧(key左 value右)
+                if abs(dcy) < sr_dy and sr_dx_lo < dcx < sr_dx_hi:   # 同行右侧(key左 value右)
                     cands.append((v, dcx))
-                elif -130 < dcy < -30 and abs(dcx) < 260:    # 正上方(value上 key下)
+                elif ab_dy_lo < dcy < ab_dy_hi and abs(dcx) < ab_dx:  # 正上方(value上 key下)
                     cands.append((v, 100000 + abs(dcx)))
             if cands:
                 cands.sort(key=lambda x: x[1])
@@ -596,30 +751,74 @@ class DouyinCrawler:
         return params
 
     def collect_full_params_page(self):
-        """进入完整参数页(点参数容器)，上滑收集全部参数，返回键值对 dict。
+        """点参数入口图标进完整参数页，上滑收集全部参数，返回键值对 dict。
 
-        完整参数页参数较多，一屏放不下，需上滑多次收集；按 key 去重合并。
-        流程：找锚点 → 点参数容器进完整页 → 逐屏 OCR+配对+上滑 → 关闭完整页。
+        图标与推荐区相似图标同款，单点最高匹配可能误进推荐商品页。故用 find_all 取多个
+        候选位置，逐个点击 + 验证(有"产品参数"标题才算进完整页)，没进就 back 换下一个。
         """
-        anchor = self.find_params_entry()
-        if not anchor:
-            return {}
-        # 点击参数入口图标本身进完整参数页(图标即入口，不再用相对偏移)
-        self.logger.info(f"点击参数入口图标进完整参数页 @({int(anchor['cx'])},{int(anchor['cy'])})")
-        self.adb.tap(anchor["cx"], anchor["cy"])
-        time.sleep(config.DETAIL_CONFIG["detail_settle_seconds"])
-        params = {}
-        for j in range(6):
-            batch = self.collect_params_full(self._shot_ocr())
-            new = {k: v for k, v in batch.items() if k not in params}
-            params.update(batch)
-            self.logger.info(f"完整参数页第{j+1}屏 +{len(new)} 项(累计{len(params)})")
-            if not new and j > 0:
-                break
+        import glob
+        tpls = sorted(glob.glob(os.path.join(self.tmpl.template_dir, "param_icon*.png")))
+        max_scrolls = config.DETAIL_CONFIG["max_scrolls_find_params"]
+        w = self.adb.window_size()["w"]
+        for i in range(max_scrolls):
+            shot = self._shot()
+            candidates = []
+            for tpl in tpls:
+                candidates.extend(self.tmpl.find_all(shot, os.path.basename(tpl)))
+            if not candidates:
+                # 备用：无图标时点表面参数行
+                items = self.ocr.recognize(shot)
+                keys = [it for it in items if self._is_param_key(it)]
+                if len(keys) >= 2:
+                    cy = int(sum(k["cy"] for k in keys) / len(keys))
+                    candidates.append((w * 0.5, cy, 0.0))
+            if candidates:
+                candidates.sort(key=lambda x: -x[2])  # 相似度降序
+                self.logger.info(f"第{i+1}屏 找到 {len(candidates)} 个入口候选，逐个验证")
+                for cx, cy, score in candidates:
+                    self.logger.info(f"  点击候选 @({int(cx)},{int(cy)}) score={score:.2f}")
+                    self.adb.tap(cx, cy)
+                    time.sleep(config.DETAIL_CONFIG["detail_settle_seconds"])
+                    params = self._collect_params_from_full()
+                    if params is not None:
+                        # 进了完整参数页并收集完，关闭完整页返回
+                        self.adb.back()
+                        time.sleep(config.CRAWL_CONFIG["settle_seconds"])
+                        return params
+                    # 没进完整页(误匹配推荐区)，back 退回详情，试下一个候选
+                    self.adb.back()
+                    time.sleep(0.8)
             self.adb.swipe_up()
             time.sleep(config.CRAWL_CONFIG["settle_seconds"])
-        self.adb.back()  # 关闭完整参数页
-        time.sleep(config.CRAWL_CONFIG["settle_seconds"])
+        self.logger.warning("未成功进入完整参数页")
+        return {}
+
+    def _collect_params_from_full(self):
+        """当前屏若在完整参数页(有"产品参数"标题)，配对标题下方参数 + 上滑收集，返回 dict；
+        不在完整页(无标题)返回 None，供调用方判断是否换候选重试。"""
+        items = self._shot_ocr()
+        title = self.ocr.find_text(items, ["产品参数", "商品参数", "规格参数", "配置参数"])
+        if not title:
+            title = next((it for it in items
+                          if "参数" in it["text"] and it["cy"] < self.adb.dp(300)), None)
+        if not title:
+            return None  # 不在完整参数页
+        min_cy = int(title["bottom"])
+        params = dict(self.collect_params_full([it for it in items if it["cy"] > min_cy]))
+        self.logger.info(f"进入完整参数页 ✓ 第1屏 {len(params)} 项")
+        for j in range(5):
+            self.adb.swipe_up()
+            time.sleep(config.CRAWL_CONFIG["settle_seconds"])
+            items2 = self._shot_ocr()
+            t2 = (self.ocr.find_text(items2, ["产品参数", "商品参数", "规格参数", "配置参数"])
+                  or next((it for it in items2
+                           if "参数" in it["text"] and it["cy"] < self.adb.dp(300)), None))
+            mc = int(t2["bottom"]) if t2 else min_cy
+            batch = self.collect_params_full([it for it in items2 if it["cy"] > mc])
+            new = {k: v for k, v in batch.items() if k not in params}
+            params.update(batch)
+            if not new and j > 0:
+                break
         return params
 
     def _looks_like_key_row(self, items):
@@ -663,7 +862,7 @@ class DouyinCrawler:
              含≥N 项、B 行像参数名)，B 行每项按 cx 最近配对 A 行的 value。
         """
         cfg = config.DETAIL_CONFIG
-        dy_min, dy_max = cfg["param_row_dy"]
+        dy_min, dy_max = self._px["param_row_dy"]
         # 排除参数容器标签本身(产品参数/商品参数/规格参数等)——它是容器标题不是
         # 参数项，不排除会出现"产品参数→退货包邮卷"这类错配
         items = [it for it in items
@@ -673,7 +872,7 @@ class DouyinCrawler:
         for it in sorted(items, key=lambda x: x["cy"]):
             placed = False
             for r in rows:
-                if abs(it["cy"] - r["cy"]) < cfg["param_row_cy_tol"]:
+                if abs(it["cy"] - r["cy"]) < self._px["param_row_cy_tol"]:
                     r["items"].append(it)
                     placed = True
                     break
@@ -697,7 +896,7 @@ class DouyinCrawler:
             if not self._looks_like_value_row(A["items"]):
                 continue
             for k in B["items"]:
-                best, best_d = None, cfg["param_cx_tol"] + 1
+                best, best_d = None, self._px["param_cx_tol"] + 1
                 for v in A["items"]:
                     d = abs(k["cx"] - v["cx"])
                     if d < best_d:
@@ -722,7 +921,7 @@ class DouyinCrawler:
         排除销量/贴息等噪音后的较长文字行，合并相邻行(cy 差小于阈值)为完整标题。
         """
         cfg = config.DETAIL_CONFIG
-        dy_lo, dy_hi = cfg["title_search_dy"]
+        dy_lo, dy_hi = self._px["title_search_dy"]
         lo, hi = price_cy + dy_lo, price_cy + dy_hi
         cands = [
             it for it in items
@@ -736,7 +935,7 @@ class DouyinCrawler:
         # 合并相邻行(cy 差小于阈值)为同一标题的多行
         groups = [[cands[0]]]
         for it in cands[1:]:
-            if it["cy"] - groups[-1][-1]["cy"] < cfg["title_merge_dy"]:
+            if it["cy"] - groups[-1][-1]["cy"] < self._px["title_merge_dy"]:
                 groups[-1].append(it)
             else:
                 groups.append([it])
@@ -836,6 +1035,20 @@ class DouyinCrawler:
         self._wait_text(["已找到", "相似", "同款", "商品"] + locators.PRICE_SYMBOLS, timeout=20)
         return self.scroll_and_collect()
 
+    def _reenter_list(self):
+        """重新进入拍同款结果列表。
+
+        collect_detail 的 back 链(back 关完整页 + back 返回列表)偶发退过头，落到
+        相册/拍同款首页。run_detail 检测到当前屏无价格时调用，重走完整流程回到列表。
+        """
+        self.logger.info("重进拍同款结果列表...")
+        self.start_app()
+        if not self.enter_scan():
+            return
+        self.push_image()
+        self.upload_image()
+        self._wait_text(["已找到", "相似", "同款", "商品"] + locators.PRICE_SYMBOLS, timeout=20)
+
     def run_detail(self, max_goods=5):
         """到列表，逐个进详情抓取完整信息(标题/价格/店铺/参数)。
 
@@ -862,6 +1075,13 @@ class DouyinCrawler:
         while len(results) < max_goods and idle_scrolls < 4:
             items = self._shot_ocr()
             all_prices = self.ocr.find_prices(items)
+            # 当前屏无价格 = 不在结果列表(collect_detail 的 back 链可能退过头到相册/
+            # 拍同款首页)，重进拍同款搜索回列表，避免一直卡在相册空转
+            if not all_prices:
+                self.logger.warning("当前屏无价格(疑似退到相册/拍同款)，重进结果列表...")
+                self._reenter_list()
+                idle_scrolls = 0
+                continue
             # 只点左半屏商品(避开右下直播入口)，cx>50 排除屏幕左边缘误识别
             prices = [p for p in all_prices if 50 < p["cx"] < w * 0.5]
             p = next((x for x in prices if _norm_price(x["text"]) not in seen_prices), None)

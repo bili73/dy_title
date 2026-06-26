@@ -8,6 +8,15 @@ config.py
   adb 截图/点击/滑动/启动 + RapidOCR 识别文字坐标 + OpenCV 模板匹配找图标。
 
 集中管理：adb 路径、设备、livelite 包名/Activity、图片路径、抓取参数、输出、模板。
+
+设备分辨率/DPI 适配：
+  凡是「相对锚点的像素偏移」和「配对容差/区间」一律用 **dp**（density-independent
+  pixel）表达，运行时由 AdbController.dp() 按设备实际 dpi 换算成 px：
+      px = round(dp * dpi / 160)
+  基准设备 1080x2376 @ 480dpi（1dp=3px）。DETAIL_CONFIG 中带坐标语义的字段、以及
+  LIST_OFFSETS_DP 的值，单位均为 dp（注释里标注 [dp]）。换分辨率/DPI 的手机自动适配，
+  无需改代码。与坐标无关的字段（秒数/次数/字数/置信度）保持原单位。
+  设备 udid 设 "auto" 时由 adb devices 自动识别（见 AdbController._resolve_udid）。
 """
 
 import os
@@ -20,7 +29,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # ==============================================================================
 ADB_CONFIG = {
     "adb_path": r"D:\Android\platform-tools\adb.exe",   # adb 绝对路径（已确认）
-    "udid": "1551169392ZZZZZ",                          # 设备序列号（vivo V2136A）
+    # "auto" = 自动取 `adb devices` 第一个在线设备；想锁死某台就填具体序列号
+    # （如原写死值 "1551169392ZZZZZ"，vivo V2136A / PD2136）
+    "udid": "auto",
     "device_screenshot": "/sdcard/dy_shot.png",         # 设备端临时截图文件
     "cmd_timeout": 30,                                  # 单条 adb 命令超时(秒)
 }
@@ -64,25 +75,46 @@ CRAWL_CONFIG = {
 #   - 参数在一个专门容器里，需下滑才能看到其入口标签(产品参数/规格)
 #   - 点开容器后参数以「网格」排列：每个单元格 value(上行) + key(下行)，
 #     value 在 key 上方约 80px，同单元格 key/value 的 cx 接近
+# ⚠️ 下面带「距离/容差」语义的字段单位为 **dp**，运行时由 AdbController.dp() 按设备
+#    实际 dpi 换算 px（基准 480dpi 下 1dp=3px）。换机自动适配。括号内标注基准像素值
+#    供对照。与坐标无关的字段（秒数/次数/字数）保持原单位。
 DETAIL_CONFIG = {
     # 详情页下滑查找「参数容器」标签(产品参数/规格)的最大滑动次数
     "max_scrolls_find_params": 8,
     # 进入详情页 / 点击参数容器后等待界面稳定秒数
     "detail_settle_seconds": 3.0,
-    # 参数网格：value 行在 key 行「上方」，两行 cy 差(像素)落在该区间才视为一组
-    "param_row_dy": (50, 120),
-    # 同一文本行聚类用的 cy 容差(像素)
-    "param_row_cy_tol": 35,
-    # key-value 配对时允许的 cx(水平) 距离容差(像素)
-    "param_cx_tol": 200,
+    # 参数网格：value 行在 key 行「上方」，两行 cy 差区间 [dp]（基准≈(50,120)px）
+    "param_row_dy": (17, 40),
+    # 同一文本行聚类用的 cy 容差 [dp]（基准≈35px）
+    "param_row_cy_tol": 12,
+    # key-value 配对时允许的 cx(水平) 距离容差 [dp]（基准≈200px）
+    "param_cx_tol": 67,
     # 一行至少含 N 个文本项才可能是参数网格行(过滤单行标题/价格/销量)
     "param_min_items_per_row": 2,
-    # 完整标题：在价格下方该 cy 偏移区间内寻找候选标题行
-    "title_search_dy": (100, 700),
-    # 候选标题行合并：相邻行 cy 差小于该值视为同一标题的多行
-    "title_merge_dy": 120,
+    # 完整标题：在价格下方该 cy 偏移区间内寻找候选标题行 [dp]（基准≈(100,700)px）
+    "title_search_dy": (33, 233),
+    # 候选标题行合并：相邻行 cy 差小于该值视为同一标题的多行 [dp]（基准≈120px）
+    "title_merge_dy": 40,
     # 候选标题行最短字数(过滤短噪音)
     "title_min_chars": 6,
+    # —— 完整参数页 key-value 配对容差（collect_params_full 用）[dp] ——
+    "full_kv_same_row_dy": 15,          # 同行右侧：value 与 key 的垂直容差(原 45px)
+    "full_kv_same_row_dx": (17, 267),   # 同行右侧：value 在 key 右侧的水平距离区间(原 50~800px)
+    "full_kv_above_dy": (-43, -10),     # 正上方：value 在 key 上方的垂直距离区间(原 -130~-30px)
+    "full_kv_above_dx": 87,             # 正上方：value 与 key 的水平容差(原 260px)
+}
+
+
+# ==============================================================================
+# 4.1 列表页/通用定位偏移（单位 dp，运行时按设备 dpi 换算 px）
+# ==============================================================================
+# 这些偏移原散落在 enter_scan/collect_goods 方法体里写死成像素，现集中于此、用 dp
+# 表达，换机自动适配。基准 480dpi(1dp=3px) 下与原像素值误差 ≤3px（容差/区间型无损）。
+LIST_OFFSETS_DP = {
+    "camera_left": 30,      # 相机入口在搜索按钮左侧的偏移（原 90px）
+    "title_above_dy": 7,    # 标题在价格上方的垂直容差（原 20px）
+    "title_right_dx": 67,   # 标题相对价格右侧的水平容差（原 200px）
+    "shop_cy_tol": 100,     # 店铺与价格的垂直距离容差（原 300px）
 }
 
 
@@ -100,17 +132,17 @@ OUTPUT_CONFIG = {
 
 
 # ==============================================================================
-# 5. 模板匹配（定位无文字的图标按钮，如相机/搜索/返回）
+# 6. 模板匹配（定位无文字的图标按钮，如相机/搜索/返回/参数入口图标）
 # ==============================================================================
 TEMPLATE_CONFIG = {
-    # 小图标模板图片放此目录，命名如 camera.png / search.png / back.png
+    # 小图标模板图片放此目录，命名如 camera.png / search.png / back.png / param_icon.png
     "template_dir": os.path.join(BASE_DIR, "templates"),
     "match_threshold": 0.60,             # OpenCV matchTemplate 阈值(0~1，越大越严)
 }
 
 
 # ==============================================================================
-# 6. OCR 服务(PaddleOCR PP-OCRv6，docker 部署)
+# 7. OCR 服务(PaddleOCR PP-OCRv6，docker 部署)
 # ==============================================================================
 # POST multipart field 'file'=<image>，返回 {count, text, lines:[{text, box, score}]}
 # box 为 4 个角点 [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]，用于算文字中心坐标驱动点击/配对。

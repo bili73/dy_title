@@ -24,3 +24,6 @@ Thumbs.db
 # 根目录散落调试截图(images/ 输入图保留)
 /*.png
 /*.jpg
+
+# web 前端上传的运行时图片
+web/uploads/

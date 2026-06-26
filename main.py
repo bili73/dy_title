@@ -51,12 +51,15 @@ def ensure_output_dir():
     os.makedirs(config.OUTPUT_CONFIG["output_dir"], exist_ok=True)
 
 
-def save_results(goods):
-    """将抓取结果保存为 JSON + 人类可读 txt 摘要。"""
-    ensure_output_dir()
-    json_path = os.path.join(
-        config.OUTPUT_CONFIG["output_dir"], config.OUTPUT_CONFIG["output_file"]
-    )
+def save_results(goods, output_dir=None):
+    """将抓取结果保存为 JSON + 人类可读 txt 摘要。
+
+    output_dir: 结果目录，默认 None 读 config.OUTPUT_CONFIG（CLI 行为不变）；
+                传入则用传入目录（前端覆盖）。
+    """
+    out_dir = output_dir or config.OUTPUT_CONFIG["output_dir"]
+    os.makedirs(out_dir, exist_ok=True)
+    json_path = os.path.join(out_dir, config.OUTPUT_CONFIG["output_file"])
     # 序列化时去掉调试用的 bbox 字段，避免 JSON 臃肿
     clean = [{k: v for k, v in g.items() if k != "box"} for g in goods]
     with open(json_path, "w", encoding="utf-8") as f:
@@ -64,9 +67,7 @@ def save_results(goods):
     print(f"\n[保存] JSON: {json_path}（共 {len(goods)} 件商品）")
 
     if config.OUTPUT_CONFIG["save_txt_summary"]:
-        txt_path = os.path.join(
-            config.OUTPUT_CONFIG["output_dir"], config.OUTPUT_CONFIG["txt_file"]
-        )
+        txt_path = os.path.join(out_dir, config.OUTPUT_CONFIG["txt_file"])
         with open(txt_path, "w", encoding="utf-8") as f:
             for idx, g in enumerate(goods, 1):
                 f.write(f"#{idx} {g.get('title', '')}\n")
@@ -84,12 +85,16 @@ def save_results(goods):
         print(f"[保存] TXT: {txt_path}")
 
 
-def save_excel(goods):
-    """保存到 Excel：每商品一行，参数合并到「参数」列(换行显示 key:value)。"""
+def save_excel(goods, output_dir=None):
+    """保存到 Excel：每商品一行，参数合并到「参数」列(换行显示 key:value)。
+
+    output_dir: 结果目录，默认 None 读 config.OUTPUT_CONFIG；传入则用传入目录。
+    """
     import openpyxl
     from openpyxl.styles import Alignment, Font
 
-    ensure_output_dir()
+    out_dir = output_dir or config.OUTPUT_CONFIG["output_dir"]
+    os.makedirs(out_dir, exist_ok=True)
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "抖音拍同款"
@@ -107,13 +112,13 @@ def save_excel(goods):
             cell.alignment = Alignment(wrap_text=True, vertical="top")
     for col, width in zip("ABCDEF", [6, 42, 12, 14, 16, 52]):
         ws.column_dimensions[col].width = width
-    path = os.path.join(config.OUTPUT_CONFIG["output_dir"], config.OUTPUT_CONFIG["excel_file"])
+    path = os.path.join(out_dir, config.OUTPUT_CONFIG["excel_file"])
     try:
         wb.save(path)
     except PermissionError:
         # 文件被占用(Excel 打开着)，改用带时间戳的备选文件名，避免整个程序崩
         import time as _t
-        path = os.path.join(config.OUTPUT_CONFIG["output_dir"],
+        path = os.path.join(out_dir,
                             f"douyin_results_{_t.strftime('%Y%m%d_%H%M%S')}.xlsx")
         wb.save(path)
         print("[警告] douyin_results.xlsx 被占用(请关闭 Excel)，已存到带时间戳的备选文件")

@@ -19,7 +19,7 @@
 | Python | 3.12（uv 托管） | 见 `.python-version` |
 | uv | `C:\Users\admin\.local\bin` | 包管理 |
 | adb | `D:\Android\platform-tools` | 已在 config 配绝对路径 |
-| 真机 | vivo V2505A / Android 16 | USB 调试已开 |
+| 真机 | vivo V2136A (PD2136) / Android 16 | USB 调试已开 |
 | 目标 App | 抖音商城 livelite | **需先手动登录一次** |
 
 **不需要** Appium / Node / JDK / Appium Inspector。
