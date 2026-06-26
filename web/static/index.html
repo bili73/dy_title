@@ -112,6 +112,10 @@
     .btn:disabled { background: #c7c7cc; cursor: not-allowed; }
     .btn.ghost { background: #fff; color: var(--text); border: 1px solid var(--border); }
     .btn.ghost:hover { background: #f5f5f7; }
+    .btn.danger { background: var(--error); }
+    .btn.danger:hover { background: #b71c1c; }
+    .actions { display: flex; gap: 8px; }
+    .actions .btn { flex: 1; }
 
     /* 状态徽标 */
     .badge {
@@ -231,7 +235,12 @@
         <div class="hint">可手输，或点「浏览…」图形化选本地目录；默认 output/。</div>
       </div>
 
-      <button class="btn" id="startBtn" disabled>开始抓取</button>
+      <div class="actions">
+        <button class="btn" id="startBtn" disabled>开始抓取</button>
+        <button class="btn ghost" id="pauseBtn" style="display:none">⏸ 暂停</button>
+        <button class="btn" id="resumeBtn" style="display:none">▶ 继续</button>
+        <button class="btn danger" id="stopBtn" style="display:none">⏹ 终止</button>
+      </div>
     </section>
 
     <!-- 右栏：监控 -->
@@ -260,7 +269,10 @@
   <div class="modal" id="dirModal">
     <div class="modal-box">
       <div class="modal-head">
-        <h2>选择保存目录</h2>
+        <div>
+          <h2 style="margin:0">选择保存目录</h2>
+          <div style="font-size:11px;color:var(--muted);margin-top:2px">单击进入子目录 · 点「选择此目录」确认</div>
+        </div>
         <button type="button" class="x" id="dirClose">×</button>
       </div>
       <div class="modal-path" id="dirPath">—</div>
@@ -278,7 +290,9 @@
     // ---- DOM ----
     const $ = (id) => document.getElementById(id);
     const dropZone = $("dropZone"), fileInput = $("fileInput"), dropText = $("dropText");
-    const preview = $("preview"), startBtn = $("startBtn");
+    const preview = $("preview"), startBtn = $("startBtn"),
+          pauseBtn = $("pauseBtn"), resumeBtn = $("resumeBtn"), stopBtn = $("stopBtn");
+    let currentStatus = "idle";  // 跟踪最新状态（upload 后据此恢复按钮组）
     const modeSeg = $("modeSeg"), maxGoodsField = $("maxGoodsField");
     const excelDir = $("excelDir"), maxGoods = $("maxGoods");
     const logs = $("logs"), shot = $("shot"), shotPh = $("shotPh");
@@ -341,7 +355,7 @@
         preview.src = data.preview_url;
         preview.classList.add("show");
         dropText.textContent = "✅ 已上传（点击可更换）";
-        startBtn.disabled = false;
+        setButtons(currentStatus);  // 上传后据当前状态恢复开始按钮
       } catch (e) {
         showToast("上传出错: " + e.message);
       }
@@ -369,6 +383,29 @@
       });
     });
 
+    // ---- 按钮组：按状态切换 开始 / 暂停 / 继续 / 终止 ----
+    function setButtons(state) {
+      const show = (el, on) => { el.style.display = on ? "block" : "none"; };
+      const inactive = (state === "idle" || state === "done" || state === "error");
+      show(startBtn, inactive);
+      show(pauseBtn, state === "running");
+      show(resumeBtn, state === "paused");
+      show(stopBtn, state === "running" || state === "paused");
+      if (inactive) startBtn.disabled = !currentImage;
+    }
+    async function postCtrl(url, msg) {
+      try {
+        const r = await fetch(url, { method: "POST" });
+        if (!r.ok) { const e = await r.json().catch(() => ({})); showToast(msg + "失败: " + (e.detail || r.status)); }
+      } catch (e) { showToast(msg + "出错: " + e.message); }
+    }
+    pauseBtn.onclick = () => postCtrl("/api/pause", "暂停");
+    resumeBtn.onclick = () => postCtrl("/api/resume", "继续");
+    stopBtn.onclick = () => {
+      if (!confirm("确定终止抓取？当前进行中的商品会丢弃，已抓的完整商品会保存。")) return;
+      postCtrl("/api/stop", "终止");
+    };
+
     // ---- 启动抓取 ----
     startBtn.addEventListener("click", async () => {
       if (!currentImage) { showToast("请先上传识别图片"); return; }
@@ -388,7 +425,7 @@
           showToast("启动失败: " + (e.detail || r.status)); return;
         }
         appendLog("▶ 启动抓取（" + mode + (mode === "detail" ? ", max=" + body.max_goods : "") + "）", "sys");
-        startBtn.disabled = true;
+        setButtons("running");  // 立即切运行态按钮组（防重复点击）
         downloads.classList.remove("show");
       } catch (e) {
         showToast("启动出错: " + e.message);
@@ -410,9 +447,12 @@
         data.dirs.forEach(n => {
           const div = document.createElement("div");
           div.className = "dir-item";
-          div.textContent = (data.is_root ? "💾 " : "📁 ") + n;
-          // 双击进入：根目录 n 是盘符(如 D:\)；否则拼当前目录 + 子目录名
-          div.ondblclick = () => loadDir(data.is_root ? n : (data.current.replace(/[\\/]+$/, "") + "\\" + n));
+          div.textContent = (data.current ? "📁 " : "💾 ") + n;
+          // 单击进入：盘符层(current 为空)n 是盘符路径(如 D:\)；否则拼当前目录 + 子目录名
+          div.onclick = () => {
+            const target = data.current ? (data.current.replace(/[\\/]+$/, "") + "\\" + n) : n;
+            loadDir(target);
+          };
           dirListEl.appendChild(div);
         });
       } catch (e) { showToast("读取目录出错: " + e.message); }
@@ -442,18 +482,16 @@
         if (ev.type === "log") {
           appendLog(`[${fmtTs(ev.ts)}] ${ev.level.padEnd(7)} ${ev.msg}`, "lv-" + ev.level);
         } else if (ev.type === "status") {
+          currentStatus = ev.state;
           setStateBadge(ev.state);
-          if (ev.state === "running") {
-            startBtn.disabled = true;
+          setButtons(ev.state);
+          if (ev.state === "paused") {
+            appendLog("⏸ 已暂停（crawler 在下个检查点停住，点「继续」恢复）", "sys");
           } else if (ev.state === "done") {
             appendLog(`✅ 抓取完成，共 ${ev.goods_count ?? 0} 件商品`, "sys");
             if (ev.goods_count > 0) downloads.classList.add("show");
-            startBtn.disabled = false;
           } else if (ev.state === "error") {
             appendLog("❌ 抓取失败: " + (ev.error || "未知错误"), "lv-ERROR");
-            startBtn.disabled = false;
-          } else if (ev.state === "idle") {
-            startBtn.disabled = !currentImage;
           }
         } else if (ev.type === "shot") {
           shot.src = ev.url;
@@ -470,6 +508,7 @@
 
     // 初始状态
     setStateBadge("idle");
+    setButtons("idle");
   </script>
 </body>
 </html>

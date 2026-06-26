@@ -19,6 +19,7 @@ import re
 import time
 import logging
 import tempfile
+import threading
 import subprocess
 
 import cv2
@@ -27,6 +28,10 @@ from rapidocr_onnxruntime import RapidOCR
 
 import config
 import locators
+
+
+class CrawlerStopped(Exception):
+    """用户终止抓取时由 _check_stop 抛出；run_detail/scroll_and_collect 捕获后返回已抓的部分结果。"""
 
 
 # ==============================================================================
@@ -380,6 +385,10 @@ class DouyinCrawler:
         self._setup_logging()
         # 把 config 里的 dp 阈值按设备 dpi 换算成 px 缓存（dpi 仅在此解析一次）
         self._cache_dp_thresholds()
+        # 停止/暂停控制（前端按钮通过 server 调 stop/pause/resume）
+        self._stop_event = threading.Event()
+        self._pause_event = threading.Event()
+        self._pause_event.set()  # 初始非暂停（set = 允许继续）
 
     def _setup_logging(self):
         self.logger = logging.getLogger("DouyinCrawler")
@@ -422,6 +431,32 @@ class DouyinCrawler:
         self.logger.info(
             f"设备 dpi={self.adb.dpi()} → 坐标阈值已按 dp 换算 px: {self._px}"
         )
+
+    # ---------- 停止 / 暂停控制（前端按钮经 server 调用）----------
+    def _check_stop(self):
+        """循环检查点调用：被要求停止则抛 CrawlerStopped；暂停则阻塞至恢复。
+
+        暂停期间用 wait(0.5) 轮询 stop，保证暂停状态下点终止也能响应。
+        """
+        if self._stop_event.is_set():
+            raise CrawlerStopped()
+        while not self._pause_event.is_set():
+            if self._stop_event.is_set():
+                raise CrawlerStopped()
+            self._pause_event.wait(timeout=0.5)
+
+    def stop(self):
+        """请求终止：置停止标志，并解除暂停(让阻塞的 _check_stop 退出后抛异常)。"""
+        self._stop_event.set()
+        self._pause_event.set()
+
+    def pause(self):
+        """请求暂停：清 pause 标志，_check_stop 将在下次检查点阻塞。"""
+        self._pause_event.clear()
+
+    def resume(self):
+        """恢复：置 pause 标志，_check_stop 的阻塞 wait 解除。"""
+        self._pause_event.set()
 
     # ---------- 基础工具 ----------
     def _shot(self):
@@ -683,6 +718,7 @@ class DouyinCrawler:
         tpls = sorted(glob.glob(os.path.join(self.tmpl.template_dir, "param_icon*.png")))
         w = self.adb.window_size()["w"]
         for i in range(max_scrolls):
+            self._check_stop()
             shot = self._shot()
             # 主方案：表盘图标模板匹配
             for tpl in tpls:
@@ -761,17 +797,15 @@ class DouyinCrawler:
         max_scrolls = config.DETAIL_CONFIG["max_scrolls_find_params"]
         w = self.adb.window_size()["w"]
         for i in range(max_scrolls):
+            self._check_stop()
             shot = self._shot()
             candidates = []
             for tpl in tpls:
                 candidates.extend(self.tmpl.find_all(shot, os.path.basename(tpl)))
             if not candidates:
-                # 备用：无图标时点表面参数行
-                items = self.ocr.recognize(shot)
-                keys = [it for it in items if self._is_param_key(it)]
-                if len(keys) >= 2:
-                    cy = int(sum(k["cy"] for k in keys) / len(keys))
-                    candidates.append((w * 0.5, cy, 0.0))
+                # 无表盘图标：暂不点(原"点表面参数行 @(屏中,cy)"易点到商品主图，
+                # 触发图片查看器误进"相册")。后续可加心型图标等更准的备用入口。
+                pass
             if candidates:
                 candidates.sort(key=lambda x: -x[2])  # 相似度降序
                 self.logger.info(f"第{i+1}屏 找到 {len(candidates)} 个入口候选，逐个验证")
@@ -785,9 +819,10 @@ class DouyinCrawler:
                         self.adb.back()
                         time.sleep(config.CRAWL_CONFIG["settle_seconds"])
                         return params
-                    # 没进完整页(误匹配推荐区)，back 退回详情，试下一个候选
-                    self.adb.back()
-                    time.sleep(0.8)
+                    # 没进完整页：不 back！@(cx,cy) 是参数图标位置，点击没进通常是无响应
+                    # (还停在详情)，再 back 会把详情→列表退掉，叠加 collect_detail 末尾的 back
+                    # 就多退成 列表→拍同款→相册。直接试下一个候选即可。
+                    time.sleep(0.5)
             self.adb.swipe_up()
             time.sleep(config.CRAWL_CONFIG["settle_seconds"])
         self.logger.warning("未成功进入完整参数页")
@@ -1008,19 +1043,23 @@ class DouyinCrawler:
         seen = set()
         all_goods = []
         limit = config.CRAWL_CONFIG["results_limit"]
-        for i in range(config.CRAWL_CONFIG["max_scroll_times"]):
-            self.logger.info(f"第 {i+1} 轮抓取 ...")
-            batch = self.collect_goods(seen)
-            all_goods.extend(batch)
-            if len(all_goods) >= limit:
-                all_goods = all_goods[:limit]
-                break
-            before = len(seen)
-            self.adb.swipe_up()
-            time.sleep(config.CRAWL_CONFIG["settle_seconds"])
-            if len(seen) == before and i > 0:
-                self.logger.info("无新商品，停止滑动")
-                break
+        try:
+            for i in range(config.CRAWL_CONFIG["max_scroll_times"]):
+                self._check_stop()
+                self.logger.info(f"第 {i+1} 轮抓取 ...")
+                batch = self.collect_goods(seen)
+                all_goods.extend(batch)
+                if len(all_goods) >= limit:
+                    all_goods = all_goods[:limit]
+                    break
+                before = len(seen)
+                self.adb.swipe_up()
+                time.sleep(config.CRAWL_CONFIG["settle_seconds"])
+                if len(seen) == before and i > 0:
+                    self.logger.info("无新商品，停止滑动")
+                    break
+        except CrawlerStopped:
+            self.logger.info(f"用户终止抓取，保留已抓 {len(all_goods)} 件")
         return all_goods
 
     def run(self):
@@ -1072,37 +1111,41 @@ class DouyinCrawler:
             m = re.search(r"[\d.]+", t)
             return m.group(0) if m else t.strip()
 
-        while len(results) < max_goods and idle_scrolls < 4:
-            items = self._shot_ocr()
-            all_prices = self.ocr.find_prices(items)
-            # 当前屏无价格 = 不在结果列表(collect_detail 的 back 链可能退过头到相册/
-            # 拍同款首页)，重进拍同款搜索回列表，避免一直卡在相册空转
-            if not all_prices:
-                self.logger.warning("当前屏无价格(疑似退到相册/拍同款)，重进结果列表...")
-                self._reenter_list()
-                idle_scrolls = 0
-                continue
-            # 只点左半屏商品(避开右下直播入口)，cx>50 排除屏幕左边缘误识别
-            prices = [p for p in all_prices if 50 < p["cx"] < w * 0.5]
-            p = next((x for x in prices if _norm_price(x["text"]) not in seen_prices), None)
-            self.logger.info(
-                f"列表扫描: 识别价格{len(all_prices)}个(左半屏{len(prices)}个) "
-                f"{[x['text'] + '@cx' + str(int(x['cx'])) for x in all_prices]} | "
-                f"已抓{seen_prices} | {'→点击' + p['text'] if p else '→下滑'}"
-            )
-            if not p:
-                # 当前屏无新商品，下滑加载更多
-                self.adb.swipe_up()
-                time.sleep(config.CRAWL_CONFIG["settle_seconds"])
-                idle_scrolls += 1
-                continue
-            seen_prices.add(_norm_price(p["text"]))
-            self.logger.info(f"=== 第 {len(results)+1}/{max_goods} 个商品: {p['text']} ===")
-            try:
-                results.append(self.collect_detail(p))
-                idle_scrolls = 0  # 抓到新商品，重置空闲计数
-            except Exception as e:
-                self.logger.warning(f"商品详情抓取失败: {e}")
-                self.adb.back()  # 兜底返回列表
-                time.sleep(config.CRAWL_CONFIG["settle_seconds"])
+        try:
+            while len(results) < max_goods and idle_scrolls < 4:
+                self._check_stop()
+                items = self._shot_ocr()
+                all_prices = self.ocr.find_prices(items)
+                # 当前屏无价格 = 不在结果列表(collect_detail 的 back 链可能退过头到相册/
+                # 拍同款首页)，重进拍同款搜索回列表，避免一直卡在相册空转
+                if not all_prices:
+                    self.logger.warning("当前屏无价格(疑似退到相册/拍同款)，重进结果列表...")
+                    self._reenter_list()
+                    idle_scrolls = 0
+                    continue
+                # 只点左半屏商品(避开右下直播入口)，cx>50 排除屏幕左边缘误识别
+                prices = [p for p in all_prices if 50 < p["cx"] < w * 0.5]
+                p = next((x for x in prices if _norm_price(x["text"]) not in seen_prices), None)
+                self.logger.info(
+                    f"列表扫描: 识别价格{len(all_prices)}个(左半屏{len(prices)}个) "
+                    f"{[x['text'] + '@cx' + str(int(x['cx'])) for x in all_prices]} | "
+                    f"已抓{seen_prices} | {'→点击' + p['text'] if p else '→下滑'}"
+                )
+                if not p:
+                    # 当前屏无新商品，下滑加载更多
+                    self.adb.swipe_up()
+                    time.sleep(config.CRAWL_CONFIG["settle_seconds"])
+                    idle_scrolls += 1
+                    continue
+                seen_prices.add(_norm_price(p["text"]))
+                self.logger.info(f"=== 第 {len(results)+1}/{max_goods} 个商品: {p['text']} ===")
+                try:
+                    results.append(self.collect_detail(p))
+                    idle_scrolls = 0  # 抓到新商品，重置空闲计数
+                except Exception as e:
+                    self.logger.warning(f"商品详情抓取失败: {e}")
+                    self.adb.back()  # 兜底返回列表
+                    time.sleep(config.CRAWL_CONFIG["settle_seconds"])
+        except CrawlerStopped:
+            self.logger.info(f"用户终止抓取，保留已抓 {len(results)} 件")
         return results

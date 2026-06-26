@@ -64,11 +64,13 @@ class CrawlerState:
 
     IDLE = "idle"
     RUNNING = "running"
+    PAUSED = "paused"
     DONE = "done"
     ERROR = "error"
 
     def __init__(self):
         self.state: str = self.IDLE
+        self.crawler: Optional[DouyinCrawler] = None  # 运行中的 crawler 引用（供 stop/pause/resume）
         self.error: Optional[str] = None
         self.excel_path: Optional[str] = None
         self.json_path: Optional[str] = None
@@ -209,6 +211,7 @@ def _run_crawl(mode: str, max_goods: int, excel_dir: str, image_path: str):
     handlers = []
     try:
         crawler = DouyinCrawler(search_image_path=image_path)
+        STATE.crawler = crawler  # 供 /api/stop /api/pause /api/resume 调用
         # 挂 SSE 日志 handler 到 crawler 及其 adb logger（覆盖流程 + 设备日志）
         h_crawler = _attach_sse_handler(crawler.logger)
         h_adb = _attach_sse_handler(crawler.adb.logger)
@@ -239,6 +242,7 @@ def _run_crawl(mode: str, max_goods: int, excel_dir: str, image_path: str):
             if h and crawler:
                 crawler.logger.removeHandler(h)
                 crawler.adb.logger.removeHandler(h)
+        STATE.crawler = None  # 抓取结束（正常/终止/出错）清理引用
 
 
 def _attach_sse_handler(logger: logging.Logger) -> SseLogHandler:
@@ -246,6 +250,40 @@ def _attach_sse_handler(logger: logging.Logger) -> SseLogHandler:
     h = SseLogHandler()
     logger.addHandler(h)
     return h
+
+
+@app.post("/api/pause")
+async def pause_crawl():
+    """暂停运行中的抓取（crawler 在下个循环检查点阻塞，手机界面停住）。"""
+    if STATE.state != CrawlerState.RUNNING:
+        raise HTTPException(409, "只能暂停运行中的抓取")
+    if STATE.crawler:
+        STATE.crawler.pause()
+        STATE.state = CrawlerState.PAUSED
+        STATE.broadcast({"type": "status", "state": CrawlerState.PAUSED})
+    return {"status": "paused"}
+
+
+@app.post("/api/resume")
+async def resume_crawl():
+    """恢复已暂停的抓取。"""
+    if STATE.state != CrawlerState.PAUSED:
+        raise HTTPException(409, "只能恢复已暂停的抓取")
+    if STATE.crawler:
+        STATE.crawler.resume()
+        STATE.state = CrawlerState.RUNNING
+        STATE.broadcast({"type": "status", "state": CrawlerState.RUNNING})
+    return {"status": "running"}
+
+
+@app.post("/api/stop")
+async def stop_crawl():
+    """终止抓取：crawler 在下个检查点退出，已抓的完整商品仍会保存。"""
+    if STATE.state not in (CrawlerState.RUNNING, CrawlerState.PAUSED):
+        raise HTTPException(409, "没有运行中/暂停的抓取可终止")
+    if STATE.crawler:
+        STATE.crawler.stop()
+    return {"status": "stopping"}
 
 
 @app.get("/api/status")
