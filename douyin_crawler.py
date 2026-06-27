@@ -511,8 +511,9 @@ class DouyinCrawler:
         self.adb.shell(f"am force-stop {config.APP_CONFIG['package']}")  # 清残留 task
         time.sleep(1)
         self.adb.am_start(f"{config.APP_CONFIG['package']}/{config.APP_CONFIG['launch_activity']}")
-        time.sleep(config.CRAWL_CONFIG["settle_seconds"] * 3)  # 多等，让活动弹窗(更新等)弹出来
-        self._dismiss_popups()  # 关启动后的活动弹窗(检测到更新等)
+        time.sleep(config.CRAWL_CONFIG["settle_seconds"] * 2)  # 等首页加载即可(不必等弹窗弹出)
+        # 不在此扫弹窗：enter_scan 改为乐观策略——先直接点相机，点不动(被弹窗挡)再扫，
+        # 没弹窗时省下启动后的弹窗扫描(原 _dismiss_popups 最少 2 轮截图+OCR ≈ 8-12s)
 
     def _dismiss_popups(self, max_rounds=4):
         """关闭启动后的活动弹窗(检测到更新/优惠券/新人福利等)。
@@ -541,37 +542,50 @@ class DouyinCrawler:
         """进入拍同款：在 livelite 首页点搜索框右侧的相机图标。
 
         ScanCommodityActivity 无法从外部 am start（会回桌面），必须走 UI。
-        策略：OCR 找顶部「搜索」按钮作锚点 → 相机在其左侧约 30dp(基准 480dpi 下≈90px) → 点击 → 验证出现「相册/识别」。
+        策略(乐观)：OCR 找顶部「搜索」按钮作锚点 → 相机在其左侧约 30dp(基准 480dpi
+        下≈90px) → 直接点击 → 验证出现「相册/识别」。多数情况没弹窗能直接进，省下
+        弹窗扫描时间；点不动(被活动弹窗挡)才 _dismiss_popups 后重试一次。
         （已真机验证：搜索按钮 cx≈1289，相机 ≈ left-90 = 1141，点击后进入拍同款页）
         """
         # 等首页加载 + 找"搜索"按钮：取最右侧的(真正的搜索按钮，排除左侧搜索框占位文字)
         anchor = None
+        items = None
         end = time.time() + 12
+        n = 0
         while time.time() < end:
             items = self._shot_ocr()
+            n += 1
             candidates = [it for it in items if "搜索" in it["text"] and it["score"] >= 0.5]
             if candidates:
                 anchor = max(candidates, key=lambda x: x["cx"])  # 最右 = 搜索按钮
+                self.logger.info(f"找到搜索按钮(第{n}次OCR)")
                 break
+            self.logger.info(f"第{n}次OCR 未见到搜索按钮，等首页加载...")
             time.sleep(1.5)
         if not anchor:
             self.logger.warning("未找到顶部'搜索'按钮，无法定位相机入口")
             return False
-        # 找到搜索 = 首页加载完，此时活动弹窗(检测到更新等)也弹出来了，关掉再点相机
-        self._dismiss_popups()
-        # 弹窗关后重新确认搜索位置(避免弹窗遮挡导致坐标偏移)
-        items2 = self._shot_ocr()
-        cand2 = [it for it in items2 if "搜索" in it["text"] and it["score"] >= 0.5]
-        if cand2:
-            anchor = max(cand2, key=lambda x: x["cx"])
-        cam_x = anchor["left"] - self._px["camera_left"]
-        cam_y = anchor["cy"]
-        self.logger.info(f"点击相机图标 @({int(cam_x)},{int(cam_y)})")
-        self.adb.tap(cam_x, cam_y)
-        time.sleep(config.CRAWL_CONFIG["settle_seconds"])
-        if self._wait_text(["相册", "识别", "对准物品"], timeout=8):
-            self.logger.info("已进入拍同款 ✓")
-            return True
+        # 乐观策略：直接点相机；点不动(被弹窗挡)再扫弹窗重试一次
+        for attempt in range(2):
+            # attempt=0 复用找搜索的 items(位置没变，省一次 OCR ~9s)；
+            # attempt=1 弹窗关后重新 OCR 确认搜索位置(弹窗可能致坐标偏移)
+            if attempt == 1:
+                items = self._shot_ocr()
+                cand = [it for it in items if "搜索" in it["text"] and it["score"] >= 0.5]
+                if cand:
+                    anchor = max(cand, key=lambda x: x["cx"])
+            cam_x = anchor["left"] - self._px["camera_left"]
+            cam_y = anchor["cy"]
+            self.logger.info(f"点击相机图标 @({int(cam_x)},{int(cam_y)})")
+            self.adb.tap(cam_x, cam_y)
+            time.sleep(config.CRAWL_CONFIG["settle_seconds"])
+            if self._wait_text(["相册", "识别", "对准物品"], timeout=8):
+                self.logger.info("已进入拍同款 ✓")
+                return True
+            # 没进拍同款：可能被活动弹窗挡，只扫 1 轮关一个弹窗即重试(省第 2 轮 OCR ~9s)
+            if attempt == 0:
+                self.logger.info("点击相机未进拍同款，扫弹窗后重试")
+                self._dismiss_popups(max_rounds=1)
         self.logger.warning("点击相机后未确认进入拍同款")
         return False
 
@@ -610,15 +624,11 @@ class DouyinCrawler:
         time.sleep(2)
         size = self.adb.window_size()
         w, h = size["w"], size["h"]
-        self.logger.info("选择首张图片(相册第一行第一张)")
+        self.logger.info("选择首张图片(相册第一行第一张) → 选完即自动发起搜索")
         self.adb.tap(w * 0.125, h * 0.22)
         time.sleep(1.5)
-        # 完成按钮：优先 OCR 找「完成」，找不到点右上角
-        self.logger.info("点完成发起搜索 ...")
-        if not self._tap_keyword(["完成", "确定", "下一步"], settle=2, score_min=0.5):
-            self.logger.info("OCR 未找到完成按钮，点右上角")
-            self.adb.tap(w * 0.90, h * 0.05)
-            time.sleep(2)
+        # 选完图拍同款自动发起搜索，无需点「完成」按钮(原 OCR 找完成 + 点右上角
+        # 多耗 ~25s，且 OCR 偶发慢)。若实测某些机型选完图不自动搜，再在此加点右上角兜底。
 
     def collect_goods(self, seen_titles):
         """识别当前屏的商品，按价格符号关联标题/店铺，返回新增商品列表。
@@ -883,9 +893,9 @@ class DouyinCrawler:
                     time.sleep(config.DETAIL_CONFIG["detail_settle_seconds"])
                     params = self._collect_params_from_full()
                     if params is not None:
-                        # 进了完整参数页并收集完，关闭完整页返回
-                        self.adb.back()
-                        time.sleep(config.CRAWL_CONFIG["settle_seconds"])
+                        # 进了完整参数页并收集完，返回(留在参数页)；关参数页+回列表统一交给
+                        # collect_detail 的 _back_to_list 状态机(避免这里 back + collect_detail 再
+                        # back 的双 back 叠加导致退过头到相册)
                         return params
                     # 点摘要行没进参数页：大概率文字不可点/仍停在详情，不 back(避免多退到相册)
                     self.logger.info("  关键词点击未进参数页，转图标模板兜底")
@@ -903,8 +913,7 @@ class DouyinCrawler:
                     time.sleep(config.DETAIL_CONFIG["detail_settle_seconds"])
                     params = self._collect_params_from_full()
                     if params is not None:
-                        self.adb.back()
-                        time.sleep(config.CRAWL_CONFIG["settle_seconds"])
+                        # 同上：留在参数页，关参数页+回列表交给 collect_detail 的 _back_to_list
                         return params
                     # 没进完整页：不 back！点击没进通常是无响应(还停在详情)，再 back 会把
                     # 详情→列表退掉，叠加 collect_detail 末尾的 back 就多退到相册。直接试下个。
@@ -1063,6 +1072,42 @@ class DouyinCrawler:
         best = max(groups, key=lambda g: sum(len(x["text"]) for x in g))
         return "".join(x["text"] for x in best).strip()
 
+    def _back_to_list(self, max_backs=5):
+        """从参数页/详情 back 回拍同款结果列表，状态机驱动(不靠固定 back 次数)。
+
+        落点判据(按可靠性优先级)：
+          - 参数页(有"产品参数"标题)         → back 关参数页
+          - 详情页(底部 客服/加入购物 操作栏)  → back 回列表
+            (详情页顶部也有"找同款"tab、底部推荐区有价格，故详情操作栏优先于"找同款")
+          - 列表页(左上角"找同款"标题 + 无详情操作栏) → 成功返回 True
+          - 其它(相册/拍同款首页)             → 退过头返回 False(run_detail 的 _reenter_list 兜底)
+        列表判据用"找同款"而非"有价格"——详情页底部推荐商品也带价格，会误判为列表。
+        """
+        for i in range(max_backs):
+            self._check_stop()
+            items = self._shot_ocr()
+            has_param_title = any("产品参数" in it["text"] for it in items)
+            in_detail = any(
+                any(k in it["text"] for k in ["客服", "加入购物"])
+                and it["cy"] > self.adb.dp(600) for it in items
+            )
+            has_ztk = any("找同款" in it["text"] for it in items)
+            if has_param_title:
+                where = "参数页"
+            elif in_detail:
+                where = "详情页"
+            elif has_ztk:
+                self.logger.info(f"back链: 第{i}次 已到列表(找同款标题) ✓")
+                return True
+            else:
+                self.logger.info(f"back链: 第{i}次 落到相册/拍同款首页(非参数页/详情/列表) → 退过头")
+                return False
+            self.logger.info(f"back链: 第{i}次 在{where}，back 继续")
+            self.adb.back()
+            time.sleep(config.CRAWL_CONFIG["settle_seconds"])
+        self.logger.warning(f"back链: back {max_backs} 次仍未到列表，兜底返回 False")
+        return False
+
     def collect_detail(self, price_item):
         """进入详情页，抓取：完整标题 + 价格(原价/券后) + 店铺 + 完整参数。
 
@@ -1113,19 +1158,19 @@ class DouyinCrawler:
             f"详情抓取：标题='{title[:30]}' 原价={origin_price} 券后={coupon_price} "
             f"店铺={shop} 参数{len(params)}项"
         )
-        # 返回列表页：先验证确实在详情(底部有 客服/购物车/旗舰店 操作栏)。
-        # 完整参数页若是全屏页，collect_full_params_page 的 back 可能已退到列表，
-        # 这里再 back 会多退成 列表→拍同款→相册，故不在详情就不 back。
-        items = self._shot_ocr()
-        in_detail = any(
-            any(k in it["text"] for k in ["客服", "购物车", "旗舰店", "加入购物"])
-            and it["cy"] > self.adb.dp(600) for it in items
-        )
-        if in_detail:
-            self.adb.back()
-            time.sleep(config.CRAWL_CONFIG["settle_seconds"])
-        else:
-            self.logger.info("当前不在详情(完整页back已退到列表)，跳过back避免多退到相册")
+        # 关键词池累积：把本商品抓到的参数键并入 params_keywords(去重保序)，后续同品类
+        # 商品用扩充后的池子匹配参数入口，命中率更高(用户只需初始撒几个关键词)。
+        if params:
+            before = len(self.params_keywords)
+            self.params_keywords = list(dict.fromkeys(self.params_keywords + list(params.keys())))
+            added = len(self.params_keywords) - before
+            if added:
+                self.logger.info(f"关键词池扩充 +{added}: {self.params_keywords}")
+        # 返回列表页：状态机 back(从参数页/详情逐层 back 到列表，按落点决定是否继续)。
+        # collect_full_params_page 收集完已不再 back(留在参数页)，back 责任统一交此处的
+        # _back_to_list，避免"参数页 back + 详情 back"双 back 叠加导致退过头到相册。
+        # _back_to_list 返回 False(真退过头)时，run_detail 下一轮检测无价格会 _reenter_list 兜底。
+        self._back_to_list()
         return {
             "title": title,
             "price": origin_price,
@@ -1212,10 +1257,11 @@ class DouyinCrawler:
                 self._check_stop()
                 items = self._shot_ocr()
                 all_prices = self.ocr.find_prices(items)
-                # 当前屏无价格 = 不在结果列表(collect_detail 的 back 链可能退过头到相册/
-                # 拍同款首页)，重进拍同款搜索回列表，避免一直卡在相册空转
-                if not all_prices:
-                    self.logger.warning("当前屏无价格(疑似退到相册/拍同款)，重进结果列表...")
+                # 列表判据：左上角"找同款"标题。详情页底部推荐区也有价格，不能用"有价格"
+                # 判列表(会把详情页误判为列表、点到推荐商品)。无"找同款"= 退到详情/相册/
+                # 拍同款首页，重进搜索回列表。
+                if not any("找同款" in it["text"] for it in items):
+                    self.logger.warning("当前屏无'找同款'标题(疑似退到详情/相册/拍同款)，重进结果列表...")
                     self._reenter_list()
                     idle_scrolls = 0
                     continue
