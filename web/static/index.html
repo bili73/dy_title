@@ -226,6 +226,21 @@
         <input type="number" id="maxGoods" value="3" min="1" max="20" />
       </div>
 
+      <div class="field" id="paramsKeywordsField" style="display:none">
+        <label>参数容器关键词（进详情抓参数用）</label>
+        <input type="text" id="paramsKeywords" placeholder="如：维修方式,上市时间 / 电压,电池容量" />
+        <div class="hint">逗号分隔。填详情页参数入口卡片上会出现的参数键文字，OCR 命中即点它进完整参数页（通吃齿轮/列表/表盘图标）。不填则用图标模板兜底。</div>
+      </div>
+
+      <div class="field">
+        <label>结果保存方式</label>
+        <div class="seg" id="appendSeg">
+          <button data-append="0" class="active">覆盖</button>
+          <button data-append="1">追加</button>
+        </div>
+        <div class="hint">覆盖=每次重写结果文件；追加=本次结果接到现有 JSON/Excel 后(累积多次抓取)。</div>
+      </div>
+
       <div class="field">
         <label>Excel / 结果保存目录</label>
         <div style="display:flex;gap:6px">
@@ -294,6 +309,7 @@
           pauseBtn = $("pauseBtn"), resumeBtn = $("resumeBtn"), stopBtn = $("stopBtn");
     let currentStatus = "idle";  // 跟踪最新状态（upload 后据此恢复按钮组）
     const modeSeg = $("modeSeg"), maxGoodsField = $("maxGoodsField");
+    const paramsKeywordsField = $("paramsKeywordsField"), paramsKeywords = $("paramsKeywords");
     const excelDir = $("excelDir"), maxGoods = $("maxGoods");
     const logs = $("logs"), shot = $("shot"), shotPh = $("shotPh");
     const downloads = $("downloads");
@@ -303,6 +319,15 @@
 
     let currentImage = null;   // 已上传图片的服务端路径
     let mode = "list";
+    let append = false;  // 结果保存方式：false=覆盖, true=追加
+    const appendSeg = $("appendSeg");
+    appendSeg.querySelectorAll("button").forEach(b => {
+      b.addEventListener("click", () => {
+        appendSeg.querySelectorAll("button").forEach(x => x.classList.remove("active"));
+        b.classList.add("active");
+        append = b.dataset.append === "1";
+      });
+    });
 
     // ---- 工具 ----
     function showToast(msg, ms = 2500) {
@@ -379,7 +404,9 @@
         modeSeg.querySelectorAll("button").forEach(x => x.classList.remove("active"));
         b.classList.add("active");
         mode = b.dataset.mode;
-        maxGoodsField.style.display = (mode === "detail") ? "block" : "none";
+        const detail = (mode === "detail");
+        maxGoodsField.style.display = detail ? "block" : "none";
+        paramsKeywordsField.style.display = detail ? "block" : "none";
       });
     });
 
@@ -414,6 +441,8 @@
         max_goods: parseInt(maxGoods.value, 10) || 3,
         excel_dir: excelDir.value.trim() || "output",
         image_path: currentImage,
+        append,
+        params_keywords: paramsKeywords.value.trim(),
       };
       try {
         const r = await fetch("/api/start", {

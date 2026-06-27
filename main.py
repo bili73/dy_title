@@ -43,6 +43,17 @@ def parse_args():
         default=5,
         help="--detail 模式下抓取的商品数量(列表第一屏前 N 个，默认 5)",
     )
+    parser.add_argument(
+        "--append",
+        action="store_true",
+        help="追加模式：把本次结果追加到现有 JSON/Excel 后(默认覆盖)",
+    )
+    parser.add_argument(
+        "--params-keywords",
+        default="",
+        help="--detail 模式参数容器关键词，逗号分隔(如 '维修方式,上市时间')。"
+             "OCR 命中即点参数摘要行进完整参数页(通吃齿轮/列表/表盘图标)；不填用图标模板兜底",
+    )
     return parser.parse_args()
 
 
@@ -51,25 +62,36 @@ def ensure_output_dir():
     os.makedirs(config.OUTPUT_CONFIG["output_dir"], exist_ok=True)
 
 
-def save_results(goods, output_dir=None):
-    """将抓取结果保存为 JSON + 人类可读 txt 摘要。
+def save_results(goods, output_dir=None, append=False):
+    """将抓取结果保存为 JSON + 人类可读 txt 摘要。返回最终商品列表(供 save_excel 用)。
 
     output_dir: 结果目录，默认 None 读 config.OUTPUT_CONFIG（CLI 行为不变）；
                 传入则用传入目录（前端覆盖）。
+    append: True=追加到现有 JSON 后(不覆盖历史结果)；False=覆盖(默认)。
     """
     out_dir = output_dir or config.OUTPUT_CONFIG["output_dir"]
     os.makedirs(out_dir, exist_ok=True)
     json_path = os.path.join(out_dir, config.OUTPUT_CONFIG["output_file"])
-    # 序列化时去掉调试用的 bbox 字段，避免 JSON 臃肿
-    clean = [{k: v for k, v in g.items() if k != "box"} for g in goods]
+    # 追加模式：先读现有结果，再拼上本次
+    existing = []
+    if append and os.path.exists(json_path):
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                existing = json.load(f) or []
+        except Exception:
+            existing = []
+    all_goods = existing + [{k: v for k, v in g.items() if k != "box"} for g in goods]
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(clean, f, ensure_ascii=False, indent=2)
-    print(f"\n[保存] JSON: {json_path}（共 {len(goods)} 件商品）")
+        json.dump(all_goods, f, ensure_ascii=False, indent=2)
+    if append and existing:
+        print(f"\n[保存] JSON: {json_path}（追加 {len(goods)} 件，累计 {len(all_goods)} 件）")
+    else:
+        print(f"\n[保存] JSON: {json_path}（共 {len(all_goods)} 件商品）")
 
     if config.OUTPUT_CONFIG["save_txt_summary"]:
         txt_path = os.path.join(out_dir, config.OUTPUT_CONFIG["txt_file"])
         with open(txt_path, "w", encoding="utf-8") as f:
-            for idx, g in enumerate(goods, 1):
+            for idx, g in enumerate(all_goods, 1):
                 f.write(f"#{idx} {g.get('title', '')}\n")
                 price_line = g.get('price', '')
                 if g.get('coupon_price'):
@@ -83,6 +105,7 @@ def save_results(goods, output_dir=None):
                         f.write(f"     {k}: {v}\n")
                 f.write("\n")
         print(f"[保存] TXT: {txt_path}")
+    return all_goods
 
 
 def save_excel(goods, output_dir=None):
@@ -140,7 +163,9 @@ def main():
     print(" 抖音商城「拍同款」抓取（adb + RapidOCR）")
     print("=" * 70)
 
-    crawler = DouyinCrawler()
+    # 解析参数容器关键词(中英文逗号分隔 → 列表，空则 crawler 回退图标模板匹配)
+    params_keywords = [k.strip() for k in args.params_keywords.replace("，", ",").split(",") if k.strip()]
+    crawler = DouyinCrawler(params_keywords=params_keywords)
     try:
         goods = crawler.run_detail(args.max_goods) if args.detail else crawler.run()
     except FileNotFoundError as e:
@@ -154,8 +179,8 @@ def main():
         print("\n[警告] 未抓取到商品，请检查 locators 关键词或拍同款流程是否走通")
         sys.exit(0)
 
-    save_results(goods)
-    save_excel(goods)
+    all_goods = save_results(goods, append=args.append)
+    save_excel(all_goods)
     print("\n抓取完成 ✅")
 
 

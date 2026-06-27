@@ -375,13 +375,17 @@ class TemplateMatcher:
 class DouyinCrawler:
     """抖音商城拍同款抓取主流程。"""
 
-    def __init__(self, search_image_path=None):
+    def __init__(self, search_image_path=None, params_keywords=None):
         self.adb = AdbController(config.ADB_CONFIG["adb_path"], config.ADB_CONFIG["udid"])
         self.ocr = OcrLocator()
         self.tmpl = TemplateMatcher(config.TEMPLATE_CONFIG["template_dir"])
         self._shot_counter = 0
         # 待搜索图片路径：传入则用传入(前端覆盖)，否则用 config 默认
         self.search_image_path = search_image_path or config.CRAWL_CONFIG["search_image_path"]
+        # 参数容器关键词(前端/CLI 传入)：详情页参数入口卡片上的参数键摘要词
+        # (如 "维修方式,上市时间")。OCR 命中即定位到参数摘要行 → 点该行进完整参数页，
+        # 替代纯图标模板匹配(齿轮/列表/表盘等图标样式通吃)。为空则回退 param_icon*.png 图标模板。
+        self.params_keywords = [k.strip() for k in (params_keywords or []) if k and k.strip()]
         self._setup_logging()
         # 把 config 里的 dp 阈值按设备 dpi 换算成 px 缓存（dpi 仅在此解析一次）
         self._cache_dp_thresholds()
@@ -507,7 +511,31 @@ class DouyinCrawler:
         self.adb.shell(f"am force-stop {config.APP_CONFIG['package']}")  # 清残留 task
         time.sleep(1)
         self.adb.am_start(f"{config.APP_CONFIG['package']}/{config.APP_CONFIG['launch_activity']}")
-        time.sleep(config.CRAWL_CONFIG["settle_seconds"] * 2)
+        time.sleep(config.CRAWL_CONFIG["settle_seconds"] * 3)  # 多等，让活动弹窗(更新等)弹出来
+        self._dismiss_popups()  # 关启动后的活动弹窗(检测到更新等)
+
+    def _dismiss_popups(self, max_rounds=4):
+        """关闭启动后的活动弹窗(检测到更新/优惠券/新人福利等)。
+
+        OCR 找弹窗关闭按钮(以后再说/暂不/知道了/关闭/取消)，点到没有为止。
+        ⚠️ "立即使用/立即升级"这类会跳转离开首页，不点。只点明确的"关闭类"按钮。
+        弹窗若在中下部(cy>1000)且不挡顶部相机，可忽略。
+        ⚠️ 弹窗可能延迟弹出，故前 2 轮没找到也继续(第 2 轮再确认)。
+        """
+        close_words = ["以后再说", "暂不升级", "暂不", "知道了", "关闭", "取消",
+                       "下次再说", "忽略", "稍后"]
+        for i in range(max_rounds):
+            items = self._shot_ocr()
+            btn = next((it for it in items if any(w in it["text"] for w in close_words)), None)
+            if btn:
+                self.logger.info(f"关闭弹窗：点 '{btn['text']}' @({int(btn['cx'])},{int(btn['cy'])})")
+                self.adb.tap(btn["cx"], btn["cy"])
+                time.sleep(2)
+            else:
+                self.logger.info(f"第{i+1}轮未检测到弹窗关闭按钮")
+                if i >= 1:
+                    return  # 连续 2 轮没弹窗，认为没弹窗
+        self.logger.warning("仍有弹窗，可能需手动关")
 
     def enter_scan(self):
         """进入拍同款：在 livelite 首页点搜索框右侧的相机图标。
@@ -529,6 +557,13 @@ class DouyinCrawler:
         if not anchor:
             self.logger.warning("未找到顶部'搜索'按钮，无法定位相机入口")
             return False
+        # 找到搜索 = 首页加载完，此时活动弹窗(检测到更新等)也弹出来了，关掉再点相机
+        self._dismiss_popups()
+        # 弹窗关后重新确认搜索位置(避免弹窗遮挡导致坐标偏移)
+        items2 = self._shot_ocr()
+        cand2 = [it for it in items2 if "搜索" in it["text"] and it["score"] >= 0.5]
+        if cand2:
+            anchor = max(cand2, key=lambda x: x["cx"])
         cam_x = anchor["left"] - self._px["camera_left"]
         cam_y = anchor["cy"]
         self.logger.info(f"点击相机图标 @({int(cam_x)},{int(cam_y)})")
@@ -750,7 +785,10 @@ class DouyinCrawler:
         # 及"充气噪音<40dB"这类带 < > 数值描述的卖点
         if "·" in t or "|" in t or "<" in t or ">" in t:
             return False
-        return any(kw in t for kw in locators.PARAM_KEY_HINTS)
+        # PARAM_KEY_HINTS 命中即为 key；或用户输入的参数容器关键词命中(用户关键词
+        # 本身就是该品类的参数键，在完整参数页里也应识别为 key 参与配对)
+        return (any(kw in t for kw in locators.PARAM_KEY_HINTS)
+                or any(kw in t for kw in self.params_keywords))
 
     def collect_params_full(self, items):
         """完整参数页键值对配对：每个 key(含参数名) 找最近 value。
@@ -786,31 +824,61 @@ class DouyinCrawler:
                 used.add(id(cands[0][0]))
         return params
 
-    def collect_full_params_page(self):
-        """点参数入口图标进完整参数页，上滑收集全部参数，返回键值对 dict。
+    def _find_params_entry_by_keywords(self, keywords, items):
+        """用用户关键词在详情页 OCR 结果里定位「参数入口卡片」位置 {cx, cy, text}。
 
-        图标与推荐区相似图标同款，单点最高匹配可能误进推荐商品页。故用 find_all 取多个
-        候选位置，逐个点击 + 验证(有"产品参数"标题才算进完整页)，没进就 back 换下一个。
+        参数入口卡片右侧显示参数摘要(多个参数键用「·」/「|」/空格分隔，如
+        "维修方式·上市时间·机身厚度·电池容量…")。用户传入该品类的参数键关键词
+        (前端文本框，逗号分隔)，命中即定位到摘要行 → 点击该行进完整参数页。
+
+        打分：优先「含分隔符的摘要行」(典型参数摘要特征)，其次「命中关键词数最多」
+        的行——避免误匹配碰巧含关键词的商品标题/卖点。无关键词或未命中返回 None。
+        """
+        if not keywords:
+            return None
+        best = None  # (是否含分隔符, 命中关键词数), item
+        for it in items:
+            t = it.get("text", "")
+            if not t:
+                continue
+            hits = sum(1 for kw in keywords if kw and kw in t)
+            if hits == 0:
+                continue
+            has_sep = ("·" in t) or ("|" in t)
+            score = (1 if has_sep else 0, hits)
+            if best is None or score > best[0]:
+                best = (score, it)
+        if best is None:
+            return None
+        it = best[1]
+        self.logger.info(
+            f"关键词{keywords} 命中参数摘要「{it['text'][:24]}」 @({int(it['cx'])},{int(it['cy'])})"
+        )
+        return {"cx": it["cx"], "cy": it["cy"], "text": it["text"]}
+
+    def collect_full_params_page(self):
+        """进完整参数页收集全部参数，返回键值对 dict。
+
+        定位「参数入口卡片」优先级：
+          1) 用户关键词(前端/CLI 传入)：OCR 找含关键词的参数摘要行 → 点该行进参数页。
+             最鲁棒，通吃齿轮/列表/表盘等所有图标样式(靠卡片上的参数文字，图标再变也不怕)。
+          2) 图标模板兜底：未提供关键词、或关键词未命中/点击未进时，用 param_icon*.png
+             模板匹配找入口图标(param_icon=表盘, param_icon3=齿轮…)。
+        进参数页后用"产品参数"标题验证(见 _collect_params_from_full)，再上滑收集。
         """
         import glob
         tpls = sorted(glob.glob(os.path.join(self.tmpl.template_dir, "param_icon*.png")))
         max_scrolls = config.DETAIL_CONFIG["max_scrolls_find_params"]
-        w = self.adb.window_size()["w"]
         for i in range(max_scrolls):
             self._check_stop()
             shot = self._shot()
-            candidates = []
-            for tpl in tpls:
-                candidates.extend(self.tmpl.find_all(shot, os.path.basename(tpl)))
-            if not candidates:
-                # 无表盘图标：暂不点(原"点表面参数行 @(屏中,cy)"易点到商品主图，
-                # 触发图片查看器误进"相册")。后续可加心型图标等更准的备用入口。
-                pass
-            if candidates:
-                candidates.sort(key=lambda x: -x[2])  # 相似度降序
-                self.logger.info(f"第{i+1}屏 找到 {len(candidates)} 个入口候选，逐个验证")
-                for cx, cy, score in candidates:
-                    self.logger.info(f"  点击候选 @({int(cx)},{int(cy)}) score={score:.2f}")
+            # 1) 关键词定位参数入口(优先)：仅在用户提供了关键词时才做 OCR 匹配
+            if self.params_keywords:
+                items = self.ocr.recognize(shot)
+                entry = self._find_params_entry_by_keywords(self.params_keywords, items)
+                if entry:
+                    cx, cy = entry["cx"], entry["cy"]
+                    self.logger.info(f"第{i+1}屏 点关键词摘要行进参数页 @({int(cx)},{int(cy)})")
                     self.adb.tap(cx, cy)
                     time.sleep(config.DETAIL_CONFIG["detail_settle_seconds"])
                     params = self._collect_params_from_full()
@@ -819,9 +887,27 @@ class DouyinCrawler:
                         self.adb.back()
                         time.sleep(config.CRAWL_CONFIG["settle_seconds"])
                         return params
-                    # 没进完整页：不 back！@(cx,cy) 是参数图标位置，点击没进通常是无响应
-                    # (还停在详情)，再 back 会把详情→列表退掉，叠加 collect_detail 末尾的 back
-                    # 就多退成 列表→拍同款→相册。直接试下一个候选即可。
+                    # 点摘要行没进参数页：大概率文字不可点/仍停在详情，不 back(避免多退到相册)
+                    self.logger.info("  关键词点击未进参数页，转图标模板兜底")
+                    time.sleep(0.5)
+            # 2) 图标模板兜底：find_all 取多候选(param_icon*.png 全部模板)，逐个点击验证
+            candidates = []
+            for tpl in tpls:
+                candidates.extend(self.tmpl.find_all(shot, os.path.basename(tpl)))
+            if candidates:
+                candidates.sort(key=lambda x: -x[2])  # 相似度降序
+                self.logger.info(f"第{i+1}屏 图标候选 {len(candidates)} 个，逐个验证")
+                for cx, cy, score in candidates:
+                    self.logger.info(f"  点击候选 @({int(cx)},{int(cy)}) score={score:.2f}")
+                    self.adb.tap(cx, cy)
+                    time.sleep(config.DETAIL_CONFIG["detail_settle_seconds"])
+                    params = self._collect_params_from_full()
+                    if params is not None:
+                        self.adb.back()
+                        time.sleep(config.CRAWL_CONFIG["settle_seconds"])
+                        return params
+                    # 没进完整页：不 back！点击没进通常是无响应(还停在详情)，再 back 会把
+                    # 详情→列表退掉，叠加 collect_detail 末尾的 back 就多退到相册。直接试下个。
                     time.sleep(0.5)
             self.adb.swipe_up()
             time.sleep(config.CRAWL_CONFIG["settle_seconds"])
@@ -1027,9 +1113,19 @@ class DouyinCrawler:
             f"详情抓取：标题='{title[:30]}' 原价={origin_price} 券后={coupon_price} "
             f"店铺={shop} 参数{len(params)}项"
         )
-        # 返回列表页
-        self.adb.back()
-        time.sleep(config.CRAWL_CONFIG["settle_seconds"])
+        # 返回列表页：先验证确实在详情(底部有 客服/购物车/旗舰店 操作栏)。
+        # 完整参数页若是全屏页，collect_full_params_page 的 back 可能已退到列表，
+        # 这里再 back 会多退成 列表→拍同款→相册，故不在详情就不 back。
+        items = self._shot_ocr()
+        in_detail = any(
+            any(k in it["text"] for k in ["客服", "购物车", "旗舰店", "加入购物"])
+            and it["cy"] > self.adb.dp(600) for it in items
+        )
+        if in_detail:
+            self.adb.back()
+            time.sleep(config.CRAWL_CONFIG["settle_seconds"])
+        else:
+            self.logger.info("当前不在详情(完整页back已退到列表)，跳过back避免多退到相册")
         return {
             "title": title,
             "price": origin_price,
@@ -1132,11 +1228,19 @@ class DouyinCrawler:
                     f"已抓{seen_prices} | {'→点击' + p['text'] if p else '→下滑'}"
                 )
                 if not p:
-                    # 当前屏无新商品，下滑加载更多
-                    self.adb.swipe_up()
-                    time.sleep(config.CRAWL_CONFIG["settle_seconds"])
-                    idle_scrolls += 1
-                    continue
+                    # 当前屏无未抓商品：先重 OCR 一次(PaddleOCR 偶发漏识别价格，
+                    # 否则会漏抓当前屏剩余商品就下滑)，确认确实没有才下滑
+                    items2 = self._shot_ocr()
+                    prices2 = [x for x in self.ocr.find_prices(items2)
+                               if 50 < x["cx"] < w * 0.5]
+                    p = next((x for x in prices2 if _norm_price(x["text"]) not in seen_prices), None)
+                    if p:
+                        self.logger.info("重OCR 发现漏识别的新商品价格")
+                    if not p:
+                        self.adb.swipe_up()
+                        time.sleep(config.CRAWL_CONFIG["settle_seconds"])
+                        idle_scrolls += 1
+                        continue
                 seen_prices.add(_norm_price(p["text"]))
                 self.logger.info(f"=== 第 {len(results)+1}/{max_goods} 个商品: {p['text']} ===")
                 try:

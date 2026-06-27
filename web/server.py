@@ -25,6 +25,7 @@ web/server.py
 import os
 import sys
 import json
+import re
 import time
 import queue
 import logging
@@ -181,6 +182,11 @@ async def start_crawl(request: Request):
     max_goods = int(body.get("max_goods", 5))
     excel_dir = body.get("excel_dir") or config.OUTPUT_CONFIG["output_dir"]
     image_path = body.get("image_path")
+    append = bool(body.get("append", False))
+    # 参数容器关键词(详情模式用)：逗号/中文逗号/空白分隔的参数键摘要词，用于 OCR 定位
+    # 参数入口卡片。如 "维修方式,上市时间" / "电压,电池容量"。空则回退图标模板匹配。
+    params_keywords_raw = body.get("params_keywords") or ""
+    params_keywords = [k.strip() for k in re.split(r"[,，\s]+", params_keywords_raw) if k.strip()]
 
     if not image_path or not os.path.isfile(image_path):
         raise HTTPException(400, "请先上传待搜索图片")
@@ -189,18 +195,22 @@ async def start_crawl(request: Request):
 
     threading.Thread(
         target=_run_crawl,
-        args=(mode, max_goods, excel_dir, image_path),
+        args=(mode, max_goods, excel_dir, image_path, append, params_keywords),
         daemon=True,
     ).start()
     return {"status": "started", "state": CrawlerState.RUNNING}
 
 
-def _run_crawl(mode: str, max_goods: int, excel_dir: str, image_path: str):
+def _run_crawl(mode: str, max_goods: int, excel_dir: str, image_path: str,
+               append: bool = False, params_keywords: Optional[list] = None):
     """后台线程：构造 crawler、挂 SSE 日志、跑抓取、保存结果、更新状态。
 
-    任何异常都捕获并广播 error 状态，绝不让线程静默崩。SSE 日志 handler 仅在此
-    抓取期间挂载，结束后摘除。
+    append=True 时把本次结果追加到现有 JSON/Excel 后(不覆盖历史)。
+    params_keywords 为详情模式参数容器关键词列表(前端文本框)，传给 crawler 用于
+    OCR 定位参数入口卡片(替代纯图标模板匹配)。任何异常都捕获并广播 error 状态，
+    绝不让线程静默崩。SSE 日志 handler 仅在此抓取期间挂载，结束后摘除。
     """
+
     STATE.state = CrawlerState.RUNNING
     STATE.error = None
     STATE.goods_count = 0
@@ -210,7 +220,7 @@ def _run_crawl(mode: str, max_goods: int, excel_dir: str, image_path: str):
     crawler = None
     handlers = []
     try:
-        crawler = DouyinCrawler(search_image_path=image_path)
+        crawler = DouyinCrawler(search_image_path=image_path, params_keywords=params_keywords)
         STATE.crawler = crawler  # 供 /api/stop /api/pause /api/resume 调用
         # 挂 SSE 日志 handler 到 crawler 及其 adb logger（覆盖流程 + 设备日志）
         h_crawler = _attach_sse_handler(crawler.logger)
@@ -221,8 +231,8 @@ def _run_crawl(mode: str, max_goods: int, excel_dir: str, image_path: str):
 
         STATE.goods_count = len(goods)
         if goods:
-            cli_main.save_results(goods, output_dir=excel_dir)
-            cli_main.save_excel(goods, output_dir=excel_dir)
+            all_goods = cli_main.save_results(goods, output_dir=excel_dir, append=append)
+            cli_main.save_excel(all_goods, output_dir=excel_dir)
             STATE.json_path = os.path.join(excel_dir, config.OUTPUT_CONFIG["output_file"])
             STATE.txt_path = os.path.join(excel_dir, config.OUTPUT_CONFIG["txt_file"])
             STATE.excel_path = os.path.join(excel_dir, config.OUTPUT_CONFIG["excel_file"])
