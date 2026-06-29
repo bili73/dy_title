@@ -6,7 +6,7 @@ launcher.py
 ================================================================================
 双击 exe 流程:
   1. 检测 Docker 是否运行(没运行提示先启动 Docker Desktop)
-  2. 检测 OCR 容器(dev-paddleocr): 在跑→跳过; 已建→start; 没有→docker load 同目录
+  2. 检测 OCR 容器(dev-paddleocr): 在跑->跳过; 已建->start; 没有->docker load 同目录
      paddleocr.tar + docker run 创建
   3. 等 OCR 服务就绪(健康检查 / running，加载模型约 10-30 秒)
   4. 启动 Web 服务(8010) + 自动打开浏览器
@@ -22,6 +22,18 @@ import threading
 import webbrowser
 
 import requests
+
+# Windows console 默认 GBK，✓✗→ 等 Unicode 符号 + 中文混合会 UnicodeEncodeError 让 exe 崩。
+# 切 console codepage 到 utf-8 + reconfigure stdout/stderr utf-8，中文/符号都正常显示。
+try:
+    subprocess.run(["cmd", "/c", "chcp", "65001"], capture_output=True, check=False)
+except Exception:
+    pass
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 OCR_CONTAINER = "dev-paddleocr"   # OCR 容器名(与抓取端 OCR_CONFIG 对应)
 OCR_IMAGE = "dev-paddleocr"       # docker load 后的镜像名
@@ -75,54 +87,54 @@ def _pause_exit():
 def ensure_ocr(d):
     """确保 OCR 容器运行。返回 True/False。需 docker + 镜像(或同目录 tar)。"""
     if not docker_ok():
-        print("❌ Docker 未运行！请先启动 Docker Desktop，等它完全起来后再双击 exe。")
+        print("[ERR] Docker 未运行！请先启动 Docker Desktop，等它完全起来后再双击 exe。")
         _pause_exit()
         return False
     state = container_state(OCR_CONTAINER)
     if state == "running":
-        print("✓ OCR 容器已在运行")
+        print("[OK] OCR 容器已在运行")
     elif state == "exists":
-        print("→ 启动已有 OCR 容器...")
+        print("-> 启动已有 OCR 容器...")
         if _run(["docker", "start", OCR_CONTAINER]).returncode != 0:
-            print("❌ docker start 失败")
+            print("[ERR] docker start 失败")
             return False
     else:
-        # 没容器 → 需镜像(没镜像则从同目录 tar 加载)
+        # 没容器 -> 需镜像(没镜像则从同目录 tar 加载)
         if not image_exists(OCR_IMAGE):
             tar = os.path.join(d, "paddleocr.tar")
             if not os.path.isfile(tar):
-                print(f"❌ 未找到镜像文件: {tar}")
+                print(f"[ERR] 未找到镜像文件: {tar}")
                 print("   请把 paddleocr.tar 放到 exe 同目录后重试。")
                 _pause_exit()
                 return False
-            print("→ 加载镜像 paddleocr.tar（首次较慢，请等待）...")
+            print("-> 加载镜像 paddleocr.tar（首次较慢，请等待）...")
             if _run(["docker", "load", "-i", tar]).returncode != 0:
-                print("❌ docker load 失败")
+                print("[ERR] docker load 失败")
                 return False
-            print("✓ 镜像加载完成")
-        print("→ 创建并启动 OCR 容器...")
+            print("[OK] 镜像加载完成")
+        print("-> 创建并启动 OCR 容器...")
         r = _run(["docker", "run", "-d", "--name", OCR_CONTAINER,
                   "-p", f"{OCR_PORT}:9300", OCR_IMAGE])
         if r.returncode != 0:
-            print(f"❌ docker run 失败: {r.stderr}")
+            print(f"[ERR] docker run 失败: {r.stderr}")
             print("   (若提示端口占用，可能别的程序用了 9300)")
             return False
     # 等 OCR 就绪
-    print("→ 等 OCR 服务就绪(加载模型约 10-30 秒)...")
+    print("-> 等 OCR 服务就绪(加载模型约 10-30 秒)...")
     for _ in range(40):
         try:
             if "running" in requests.get(f"http://localhost:{OCR_PORT}/", timeout=2).text:
-                print("✓ OCR 服务就绪")
+                print("[OK] OCR 服务就绪")
                 return True
         except Exception:
             pass
         time.sleep(2)
-    print("❌ OCR 就绪超时(80秒)。查日志: docker logs dev-paddleocr")
+    print("[ERR] OCR 就绪超时(80秒)。查日志: docker logs dev-paddleocr")
     return False
 
 
 def main():
-    """启动器主流程：部署 OCR → 启动 Web → 开浏览器。"""
+    """启动器主流程：部署 OCR -> 启动 Web -> 开浏览器。"""
     d = app_dir()
     if d not in sys.path:
         sys.path.insert(0, d)  # 让 import web.server/config/douyin_crawler 找到项目根
@@ -134,7 +146,7 @@ def main():
         _pause_exit()
         return
 
-    print(f"\n→ 启动 Web 服务(端口 {WEB_PORT})，浏览器即将自动打开...\n")
+    print(f"\n-> 启动 Web 服务(端口 {WEB_PORT})，浏览器即将自动打开...\n")
     # 延迟 2 秒开浏览器(等 web server 起来)
     threading.Thread(
         target=lambda: (time.sleep(2.0), webbrowser.open(f"http://localhost:{WEB_PORT}")),
