@@ -35,8 +35,8 @@ for _s in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
-OCR_CONTAINER = "dev-paddleocr"   # OCR 容器名(与抓取端 OCR_CONFIG 对应)
-OCR_IMAGE = "dev-paddleocr"       # docker load 后的镜像名
+OCR_CONTAINER = "dev-paddleocr"          # OCR 容器名(与抓取端 OCR_CONFIG 对应)
+OCR_IMAGE = "dev-services-paddleocr"     # 镜像名(docker load 后；docker run 用)
 OCR_PORT = 9300
 WEB_PORT = 8010
 
