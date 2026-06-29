@@ -251,6 +251,12 @@
       </div>
 
       <div class="field">
+        <label>结果文件名（不含扩展名）</label>
+        <input type="text" id="outputName" placeholder="如：手机参数 / 轮胎（留空默认 douyin_results）" />
+        <div class="hint">保存为「文件名.json/.txt/.xlsx」。留空：覆盖模式用当前时间戳，追加模式用 douyin_results。</div>
+      </div>
+
+      <div class="field">
         <button type="button" class="btn ghost" id="calibrateBtn">✥ 校准相册首图（换设备后用）</button>
         <div class="hint">换设备/相册改版后点此：进相册截图 → 在图上点一下首图位置 → 自动保存，后续抓取用此坐标。</div>
       </div>
@@ -335,7 +341,7 @@
     let currentStatus = "idle";  // 跟踪最新状态（upload 后据此恢复按钮组）
     const modeSeg = $("modeSeg"), maxGoodsField = $("maxGoodsField");
     const paramsKeywordsField = $("paramsKeywordsField"), paramsKeywords = $("paramsKeywords");
-    const excelDir = $("excelDir"), maxGoods = $("maxGoods");
+    const excelDir = $("excelDir"), maxGoods = $("maxGoods"), outputName = $("outputName");
     const logs = $("logs"), shot = $("shot"), shotPh = $("shotPh");
     const downloads = $("downloads");
     const stateText = $("stateText"), runText = $("runText");
@@ -468,6 +474,7 @@
         image_path: currentImage,
         append,
         params_keywords: paramsKeywords.value.trim(),
+        output_name: outputName.value.trim(),
       };
       try {
         const r = await fetch("/api/start", {

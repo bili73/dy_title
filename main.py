@@ -15,6 +15,7 @@ main.py
 import os
 import sys
 import json
+import re
 import argparse
 import logging
 
@@ -62,16 +63,29 @@ def ensure_output_dir():
     os.makedirs(config.OUTPUT_CONFIG["output_dir"], exist_ok=True)
 
 
-def save_results(goods, output_dir=None, append=False):
+def _safe_output_name(name):
+    """清理自定义结果文件名：去路径分隔/Windows 非法字符，空则默认 douyin_results。
+    防路径穿越(前端传的文件名不能带 / \\ .. 等)。"""
+    if not name:
+        return "douyin_results"
+    cleaned = re.sub(r"[\\/]", "", str(name)).strip()
+    cleaned = re.sub(r'[<>:"|*?]', "_", cleaned).strip()
+    return cleaned or "douyin_results"
+
+
+def save_results(goods, output_dir=None, append=False, output_name=None):
     """将抓取结果保存为 JSON + 人类可读 txt 摘要。返回最终商品列表(供 save_excel 用)。
 
     output_dir: 结果目录，默认 None 读 config.OUTPUT_CONFIG（CLI 行为不变）；
                 传入则用传入目录（前端覆盖）。
     append: True=追加到现有 JSON 后(不覆盖历史结果)；False=覆盖(默认)。
+    output_name: 自定义结果文件名(不含扩展名)，如"手机参数" → 手机参数.json/.txt；
+                None 则默认 douyin_results。
     """
     out_dir = output_dir or config.OUTPUT_CONFIG["output_dir"]
     os.makedirs(out_dir, exist_ok=True)
-    json_path = os.path.join(out_dir, config.OUTPUT_CONFIG["output_file"])
+    base = _safe_output_name(output_name)
+    json_path = os.path.join(out_dir, base + ".json")
     # 追加模式：先读现有结果，再拼上本次
     existing = []
     if append and os.path.exists(json_path):
@@ -89,7 +103,7 @@ def save_results(goods, output_dir=None, append=False):
         print(f"\n[保存] JSON: {json_path}（共 {len(all_goods)} 件商品）")
 
     if config.OUTPUT_CONFIG["save_txt_summary"]:
-        txt_path = os.path.join(out_dir, config.OUTPUT_CONFIG["txt_file"])
+        txt_path = os.path.join(out_dir, base + ".txt")
         with open(txt_path, "w", encoding="utf-8") as f:
             for idx, g in enumerate(all_goods, 1):
                 f.write(f"#{idx} {g.get('title', '')}\n")
@@ -108,16 +122,18 @@ def save_results(goods, output_dir=None, append=False):
     return all_goods
 
 
-def save_excel(goods, output_dir=None):
+def save_excel(goods, output_dir=None, output_name=None):
     """保存到 Excel：每商品一行，参数合并到「参数」列(换行显示 key:value)。
 
     output_dir: 结果目录，默认 None 读 config.OUTPUT_CONFIG；传入则用传入目录。
+    output_name: 自定义文件名(不含扩展名)，None 则默认 douyin_results。
     """
     import openpyxl
     from openpyxl.styles import Alignment, Font
 
     out_dir = output_dir or config.OUTPUT_CONFIG["output_dir"]
     os.makedirs(out_dir, exist_ok=True)
+    base = _safe_output_name(output_name)
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "抖音拍同款"
@@ -135,16 +151,15 @@ def save_excel(goods, output_dir=None):
             cell.alignment = Alignment(wrap_text=True, vertical="top")
     for col, width in zip("ABCDEF", [6, 42, 12, 14, 16, 52]):
         ws.column_dimensions[col].width = width
-    path = os.path.join(out_dir, config.OUTPUT_CONFIG["excel_file"])
+    path = os.path.join(out_dir, base + ".xlsx")
     try:
         wb.save(path)
     except PermissionError:
         # 文件被占用(Excel 打开着)，改用带时间戳的备选文件名，避免整个程序崩
         import time as _t
-        path = os.path.join(out_dir,
-                            f"douyin_results_{_t.strftime('%Y%m%d_%H%M%S')}.xlsx")
+        path = os.path.join(out_dir, f"{base}_{_t.strftime('%Y%m%d_%H%M%S')}.xlsx")
         wb.save(path)
-        print("[警告] douyin_results.xlsx 被占用(请关闭 Excel)，已存到带时间戳的备选文件")
+        print(f"[警告] {base}.xlsx 被占用(请关闭 Excel)，已存到带时间戳的备选文件")
     print(f"[保存] Excel: {path}")
 
 
@@ -179,8 +194,11 @@ def main():
         print("\n[警告] 未抓取到商品，请检查 locators 关键词或拍同款流程是否走通")
         sys.exit(0)
 
-    all_goods = save_results(goods, append=args.append)
-    save_excel(all_goods)
+    # 文件名：append 模式默认 douyin_results(追加历史)，覆盖模式默认当前时间戳
+    import time as _t
+    _base = "douyin_results" if args.append else _t.strftime("%Y%m%d_%H%M%S")
+    all_goods = save_results(goods, append=args.append, output_name=_base)
+    save_excel(all_goods, output_name=_base)
     print("\n抓取完成 ✅")
 
 

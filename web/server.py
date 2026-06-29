@@ -190,6 +190,8 @@ async def start_crawl(request: Request):
     # 参数入口卡片。如 "维修方式,上市时间" / "电压,电池容量"。空则回退图标模板匹配。
     params_keywords_raw = body.get("params_keywords") or ""
     params_keywords = [k.strip() for k in re.split(r"[,，\s]+", params_keywords_raw) if k.strip()]
+    # 自定义结果文件名(不含扩展名，如"手机参数"；空则默认 douyin_results)
+    output_name = (body.get("output_name") or "").strip()
 
     if not image_path or not os.path.isfile(image_path):
         raise HTTPException(400, "请先上传待搜索图片")
@@ -198,14 +200,15 @@ async def start_crawl(request: Request):
 
     threading.Thread(
         target=_run_crawl,
-        args=(mode, max_goods, excel_dir, image_path, append, params_keywords),
+        args=(mode, max_goods, excel_dir, image_path, append, params_keywords, output_name),
         daemon=True,
     ).start()
     return {"status": "started", "state": CrawlerState.RUNNING}
 
 
 def _run_crawl(mode: str, max_goods: int, excel_dir: str, image_path: str,
-               append: bool = False, params_keywords: Optional[list] = None):
+               append: bool = False, params_keywords: Optional[list] = None,
+               output_name: Optional[str] = None):
     """后台线程：构造 crawler、挂 SSE 日志、跑抓取、保存结果、更新状态。
 
     append=True 时把本次结果追加到现有 JSON/Excel 后(不覆盖历史)。
@@ -234,11 +237,20 @@ def _run_crawl(mode: str, max_goods: int, excel_dir: str, image_path: str,
 
         STATE.goods_count = len(goods)
         if goods:
-            all_goods = cli_main.save_results(goods, output_dir=excel_dir, append=append)
-            cli_main.save_excel(all_goods, output_dir=excel_dir)
-            STATE.json_path = os.path.join(excel_dir, config.OUTPUT_CONFIG["output_file"])
-            STATE.txt_path = os.path.join(excel_dir, config.OUTPUT_CONFIG["txt_file"])
-            STATE.excel_path = os.path.join(excel_dir, config.OUTPUT_CONFIG["excel_file"])
+            # 文件名优先级：用户填的(清理) > append 模式默认 douyin_results(追加历史)
+            # > 覆盖模式默认当前时间戳(如 20260629_154530)
+            if output_name and output_name.strip():
+                base = cli_main._safe_output_name(output_name)
+            elif append:
+                base = "douyin_results"
+            else:
+                import time as _t
+                base = _t.strftime("%Y%m%d_%H%M%S")
+            all_goods = cli_main.save_results(goods, output_dir=excel_dir, append=append, output_name=base)
+            cli_main.save_excel(all_goods, output_dir=excel_dir, output_name=base)
+            STATE.json_path = os.path.join(excel_dir, base + ".json")
+            STATE.txt_path = os.path.join(excel_dir, base + ".txt")
+            STATE.excel_path = os.path.join(excel_dir, base + ".xlsx")
         STATE.state = CrawlerState.DONE
         STATE.broadcast({
             "type": "status", "state": CrawlerState.DONE,
