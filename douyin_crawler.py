@@ -419,6 +419,8 @@ class DouyinCrawler:
         self._px = {
             "param_row_dy": (dp(cfg["param_row_dy"][0]), dp(cfg["param_row_dy"][1])),
             "param_row_cy_tol": dp(cfg["param_row_cy_tol"]),
+            "param_key_cx_max": dp(cfg["param_key_cx_max_dp"]),
+            "param_full_row_cy_tol": dp(cfg["param_full_row_cy_tol_dp"]),
             "param_cx_tol": dp(cfg["param_cx_tol"]),
             "title_search_dy": (dp(cfg["title_search_dy"][0]), dp(cfg["title_search_dy"][1])),
             "title_merge_dy": dp(cfg["title_merge_dy"]),
@@ -801,37 +803,62 @@ class DouyinCrawler:
                 or any(kw in t for kw in self.params_keywords))
 
     def collect_params_full(self, items):
-        """完整参数页键值对配对：每个 key(含参数名) 找最近 value。
+        """完整参数页 key-value 配对(纯结构: key 左 value 右，不依赖词典)。
 
-        完整参数页布局：多数参数「key 左 + value 右」同行；前几行网格「value 上 +
-        key 下」。对每个 key 优先配同行右侧(cx 更大)的非 key 项，其次配正上方。
-        每个 value 只用一次(used 去重)，避免多 key 抢同一 value。
+        抖音参数页布局: key 在最左一列(cx 小)，value 在其右侧(cx 大)，同一行。
+          - key 名过长时尾部会被 OCR 挤到下一行(单独成行、无 value，在 value 行下方)
+            → 拼回上一个 key 的名字(如"后置摄像头像"+value，下一行"素" → 合成
+            "后置摄像头像素"；"是否支持无线"+value，下一行"充电" → "是否支持无线充电")。
+          - 一个 key 可能多个 value: 同行右侧多个 value，或下方续行(cx 在 value 列、
+            无 key)的 value，均拼接到该 key。
+
+        算法(不认文字，纯位置；不再依赖 PARAM_KEY_HINTS 词典，新品类零维护):
+          1. 按 cy 聚类成文本行
+          2. 每行分 key 列(cx < param_key_cx_max) 与 value 列两部分:
+             - key列+value列 都有 → 新参数 key=value(s)
+             - 只有 key 列(无 value) → key 名尾部续行，拼到上一个 key 的名字
+             - 只有 value 列(无 key) → value 续行，归上一个 key(一键多值)
+          3. 多 value / 续行 value 用空格拼到该 key 的值
         """
-        keys = [it for it in items if self._is_param_key(it)]
+        KEY_CX_MAX = self._px["param_key_cx_max"]
+        ROW_DY = self._px["param_full_row_cy_tol"]
+        # 1. 按 cy 聚类成行
+        rows = []
+        for it in sorted(items, key=lambda x: x["cy"]):
+            placed = False
+            for r in rows:
+                if abs(it["cy"] - r[0]["cy"]) < ROW_DY:
+                    r.append(it)
+                    placed = True
+                    break
+            if not placed:
+                rows.append([it])
+        # 2. 逐行配对
         params = {}
-        used = set()
-        # 配对容差(已按设备 dpi 换算 px，来自 DETAIL_CONFIG 的 full_kv_* 字段，单位原为 dp)
-        sr_dy = self._px["full_kv_same_row_dy"]
-        sr_dx_lo, sr_dx_hi = self._px["full_kv_same_row_dx"]
-        ab_dy_lo, ab_dy_hi = self._px["full_kv_above_dy"]
-        ab_dx = self._px["full_kv_above_dx"]
-        for k in keys:
-            cands = []
-            for v in items:
-                if v is k or id(v) in used:
-                    continue
-                if self._is_param_key(v):
-                    continue
-                dcy = v["cy"] - k["cy"]
-                dcx = v["cx"] - k["cx"]
-                if abs(dcy) < sr_dy and sr_dx_lo < dcx < sr_dx_hi:   # 同行右侧(key左 value右)
-                    cands.append((v, dcx))
-                elif ab_dy_lo < dcy < ab_dy_hi and abs(dcx) < ab_dx:  # 正上方(value上 key下)
-                    cands.append((v, 100000 + abs(dcx)))
-            if cands:
-                cands.sort(key=lambda x: x[1])
-                params[k["text"].strip()] = cands[0][0]["text"].strip()
-                used.add(id(cands[0][0]))
+        last_key = None
+        for row in rows:
+            row.sort(key=lambda x: x["cx"])
+            key_items = [it for it in row if it["cx"] < KEY_CX_MAX]
+            val_items = [it for it in row if it["cx"] >= KEY_CX_MAX]
+            if key_items and val_items:
+                # key + value: 新参数行
+                key = key_items[0]["text"].strip()
+                params[key] = " ".join(it["text"].strip() for it in val_items)
+                last_key = key
+            elif key_items and not val_items:
+                # 只有 key 列(无 value): key 名尾部被 OCR 挤到下一行 → 拼回上一个 key 的名字
+                extra = "".join(it["text"].strip() for it in key_items)
+                if last_key is not None and last_key in params:
+                    new_key = last_key + extra
+                    params[new_key] = params.pop(last_key)
+                    last_key = new_key
+                else:
+                    params[extra] = ""  # 无上一个 key，当作无值 key
+                    last_key = extra
+            elif val_items and last_key is not None:
+                # 只有 value(无 key): value 续行 → 归上一个 key(一键多值)
+                vals = " ".join(it["text"].strip() for it in val_items)
+                params[last_key] = (params.get(last_key, "") + " " + vals).strip()
         return params
 
     def _find_params_entry_by_keywords(self, keywords, items):
@@ -854,7 +881,9 @@ class DouyinCrawler:
             hits = sum(1 for kw in keywords if kw and kw in t)
             if hits == 0:
                 continue
-            has_sep = ("·" in t) or ("|" in t)
+            # 只把「·」当参数摘要分隔(参数键用·连接)；「|」是卖点分隔(如"机身设计|215g")，
+            # 不算参数摘要，避免卖点被打高分压过真正的参数 key 行。
+            has_sep = "·" in t
             score = (1 if has_sep else 0, hits)
             if best is None or score > best[0]:
                 best = (score, it)

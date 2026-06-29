@@ -102,6 +102,14 @@ DETAIL_CONFIG = {
     "full_kv_same_row_dx": (17, 267),   # 同行右侧：value 在 key 右侧的水平距离区间(原 50~800px)
     "full_kv_above_dy": (-43, -10),     # 正上方：value 在 key 上方的垂直距离区间(原 -130~-30px)
     "full_kv_above_dx": 87,             # 正上方：value 与 key 的水平容差(原 260px)
+    # 完整参数页 key 列 cx 上限 [dp]：key 固定在最左一列(cx 小)，value 在右(cx 大)。
+    # collect_params_full 纯结构配对用——行内首项 cx < 此值即为 key，否则当作续行 value。
+    # 基准 480dpi 下 60dp≈180px(轮胎 key cx 93~131px，value cx 345+px，分界 180 安全)。
+    "param_key_cx_max_dp": 60,
+    # collect_params_full 同行聚类 cy 容差 [dp]：详情页 key+value 同行 cy 差极小(<5px)，
+    # 用比 param_row_cy_tol 更小的值，避免 key 名尾部续行(cy 差约 35~44px)被误聚进上一行
+    # (否则续行"素"会和 key"后置摄像头像"挤成同行、cx 最小被当 key)。
+    "param_full_row_cy_tol_dp": 7,
 }
 
 
