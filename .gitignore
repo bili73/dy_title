@@ -27,3 +27,7 @@ Thumbs.db
 
 # web 前端上传的运行时图片
 web/uploads/
+
+# 设备校准数据(per udid，运营点选的相册首图坐标比例，不进 git)
+calibration.json
+calibration.json.tmp

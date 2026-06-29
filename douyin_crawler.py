@@ -421,6 +421,8 @@ class DouyinCrawler:
             "param_row_cy_tol": dp(cfg["param_row_cy_tol"]),
             "param_key_cx_max": dp(cfg["param_key_cx_max_dp"]),
             "param_full_row_cy_tol": dp(cfg["param_full_row_cy_tol_dp"]),
+            "grid_dy": (dp(cfg["grid_dy_dp"][0]), dp(cfg["grid_dy_dp"][1])),
+            "grid_cx_tol": dp(cfg["grid_cx_tol_dp"]),
             "param_cx_tol": dp(cfg["param_cx_tol"]),
             "title_search_dy": (dp(cfg["title_search_dy"][0]), dp(cfg["title_search_dy"][1])),
             "title_merge_dy": dp(cfg["title_merge_dy"]),
@@ -626,11 +628,33 @@ class DouyinCrawler:
         time.sleep(2)
         size = self.adb.window_size()
         w, h = size["w"], size["h"]
-        self.logger.info("选择首张图片(相册第一行第一张) → 选完即自动发起搜索")
-        self.adb.tap(w * 0.125, h * 0.22)
+        # 首图坐标：优先用运营校准值(per udid, calibration.json 的 album_first_image)，
+        # 无则默认比例 0.125/0.22。换设备/相册改版后用前端「校准」按钮重新点选首图。
+        cal = config.get_calibration(self.adb.udid, "album_first_image") or {"x": 0.125, "y": 0.22}
+        self.logger.info(f"选择首张图片 @(w*{cal['x']},h*{cal['y']})")
+        self.adb.tap(w * cal["x"], h * cal["y"])
         time.sleep(1.5)
         # 选完图拍同款自动发起搜索，无需点「完成」按钮(原 OCR 找完成 + 点右上角
         # 多耗 ~25s，且 OCR 偶发慢)。若实测某些机型选完图不自动搜，再在此加点右上角兜底。
+
+    def calibrate_album_enter(self):
+        """校准模式：进相册选图页 + 截图，返回截图绝对路径。供运营在前端点首图位置校准。
+
+        流程：start_app → enter_scan → push_image → 点「相册」进选图页 → 截图(不点首图)。
+        运营在前端截图上点首图，调 /api/calibrate/album/save 存坐标比例(per udid)。
+        """
+        self.start_app()
+        if not self.enter_scan():
+            return None
+        self.push_image()
+        self.logger.info("校准：进入相册选图页 ...")
+        if not self._tap_keyword(locators.ALBUM, settle=2):
+            self.logger.warning("校准：未找到'相册'入口")
+            return None
+        time.sleep(2)
+        shot = self._shot()
+        self.logger.info(f"校准截图就绪: {shot}（请在前端点首图位置）")
+        return shot
 
     def collect_goods(self, seen_titles):
         """识别当前屏的商品，按价格符号关联标题/店铺，返回新增商品列表。
@@ -802,27 +826,38 @@ class DouyinCrawler:
         return (any(kw in t for kw in locators.PARAM_KEY_HINTS)
                 or any(kw in t for kw in self.params_keywords))
 
+    @staticmethod
+    def _rows_cx_aligned(row_a, row_b, cx_tol):
+        """两行是否 cx 列对齐：项数相同 + 按 cx 排序后对应项 cx 差均 < cx_tol。
+        用于判断相邻两行是否构成网格对(value 上行 + key 下行，列对齐)。"""
+        if not row_a or len(row_a) != len(row_b):
+            return False
+        for a, b in zip(row_a, row_b):  # 入参已按 cx 排序
+            if abs(a["cx"] - b["cx"]) > cx_tol:
+                return False
+        return True
+
     def collect_params_full(self, items):
-        """完整参数页 key-value 配对(纯结构: key 左 value 右，不依赖词典)。
+        """完整参数页 key-value 配对(纯结构，兼容左右 + 上下网格 + key名续行 + 一键多值)。
 
-        抖音参数页布局: key 在最左一列(cx 小)，value 在其右侧(cx 大)，同一行。
-          - key 名过长时尾部会被 OCR 挤到下一行(单独成行、无 value，在 value 行下方)
-            → 拼回上一个 key 的名字(如"后置摄像头像"+value，下一行"素" → 合成
-            "后置摄像头像素"；"是否支持无线"+value，下一行"充电" → "是否支持无线充电")。
-          - 一个 key 可能多个 value: 同行右侧多个 value，或下方续行(cx 在 value 列、
-            无 key)的 value，均拼接到该 key。
+        布局规律:
+          - 左右: key(cx<param_key_cx_max) + value(cx≥…) 同行
+          - 网格: value 上行 + key 下行，cy 差 ~65(网格行距 grid_dy)，列 cx 对齐
+          - key 名续行: 仅 key 列、无 value(OCR 把 key 名头部/尾部挤到独立行) → 找 cy
+            最近的 key 行，续行在其上方=头部前缀、下方=尾部后缀(两个方向都支持)
+          - value 续行: 仅 value 列、无 key(多值第二行) → 归上方最近 key
 
-        算法(不认文字，纯位置；不再依赖 PARAM_KEY_HINTS 词典，新品类零维护):
-          1. 按 cy 聚类成文本行
-          2. 每行分 key 列(cx < param_key_cx_max) 与 value 列两部分:
-             - key列+value列 都有 → 新参数 key=value(s)
-             - 只有 key 列(无 value) → key 名尾部续行，拼到上一个 key 的名字
-             - 只有 value 列(无 key) → value 续行，归上一个 key(一键多值)
-          3. 多 value / 续行 value 用空格拼到该 key 的值
+        算法(两遍):
+          1. 按 cy 聚类成行(param_full_row_cy_tol)
+          2. 识别网格对(相邻行 cy 差在 grid_dy + cx 列对齐) → 按 cx 配 value-key
+          3. 非网格行: 左右 key+value 配对
+          4. 续行: key 名续行找 cy 最近 key 行(上→头部/下→尾部)，value 续行归上方 key
         """
         KEY_CX_MAX = self._px["param_key_cx_max"]
         ROW_DY = self._px["param_full_row_cy_tol"]
-        # 1. 按 cy 聚类成行
+        GRID_DY_LO, GRID_DY_HI = self._px["grid_dy"]
+        GRID_CX_TOL = self._px["grid_cx_tol"]
+        # 1. 按 cy 聚类成行 + 行内按 cx 排序
         rows = []
         for it in sorted(items, key=lambda x: x["cy"]):
             placed = False
@@ -833,32 +868,70 @@ class DouyinCrawler:
                     break
             if not placed:
                 rows.append([it])
-        # 2. 逐行配对
+        for r in rows:
+            r.sort(key=lambda x: x["cx"])
+        n = len(rows)
+        # 2. 识别网格对(相邻行 cy 差在网格行距 + cx 列对齐)
+        grid_v, grid_k = set(), set()
+        grid_pairs = []
+        i = 0
+        while i < n - 1:
+            if i in grid_v or i in grid_k:
+                i += 1
+                continue
+            dy = rows[i + 1][0]["cy"] - rows[i][0]["cy"]
+            if GRID_DY_LO < dy < GRID_DY_HI and self._rows_cx_aligned(rows[i], rows[i + 1], GRID_CX_TOL):
+                grid_pairs.append((i, i + 1))  # i=value 上行, i+1=key 下行
+                grid_v.add(i)
+                grid_k.add(i + 1)
+                i += 2
+            else:
+                i += 1
+        # 3. 配对网格对 + 左右行，记录所有 key anchor(cy+key 名)供续行查找
         params = {}
-        last_key = None
-        for row in rows:
-            row.sort(key=lambda x: x["cx"])
+        anchors = []  # [{"cy":, "key":}] 已配 key 行
+        for vi, ki in grid_pairs:
+            for v, k in zip(rows[vi], rows[ki]):  # 按 cx 排序后 zip 列对齐
+                kt = k["text"].strip()
+                params[kt] = v["text"].strip()
+                anchors.append({"cy": k["cy"], "key": kt})
+        for i in range(n):
+            if i in grid_v or i in grid_k:
+                continue
+            row = rows[i]
             key_items = [it for it in row if it["cx"] < KEY_CX_MAX]
             val_items = [it for it in row if it["cx"] >= KEY_CX_MAX]
             if key_items and val_items:
-                # key + value: 新参数行
-                key = key_items[0]["text"].strip()
-                params[key] = " ".join(it["text"].strip() for it in val_items)
-                last_key = key
-            elif key_items and not val_items:
-                # 只有 key 列(无 value): key 名尾部被 OCR 挤到下一行 → 拼回上一个 key 的名字
+                kt = key_items[0]["text"].strip()
+                params[kt] = " ".join(it["text"].strip() for it in val_items)
+                anchors.append({"cy": key_items[0]["cy"], "key": kt})
+        # 4. 续行分配
+        for i in range(n):
+            if i in grid_v or i in grid_k:
+                continue
+            row = rows[i]
+            key_items = [it for it in row if it["cx"] < KEY_CX_MAX]
+            val_items = [it for it in row if it["cx"] >= KEY_CX_MAX]
+            cy = row[0]["cy"]
+            if key_items and not val_items:
+                # key 名续行: 找 cy 最近的 key anchor，上方=头部前缀、下方=尾部后缀
                 extra = "".join(it["text"].strip() for it in key_items)
-                if last_key is not None and last_key in params:
-                    new_key = last_key + extra
-                    params[new_key] = params.pop(last_key)
-                    last_key = new_key
+                anc = min(anchors, key=lambda a: abs(a["cy"] - cy)) if anchors else None
+                if anc:
+                    new_key = (extra + anc["key"]) if cy < anc["cy"] else (anc["key"] + extra)
+                    if new_key != anc["key"]:
+                        params[new_key] = params.pop(anc["key"])
+                        anc["key"] = new_key
                 else:
-                    params[extra] = ""  # 无上一个 key，当作无值 key
-                    last_key = extra
-            elif val_items and last_key is not None:
-                # 只有 value(无 key): value 续行 → 归上一个 key(一键多值)
-                vals = " ".join(it["text"].strip() for it in val_items)
-                params[last_key] = (params.get(last_key, "") + " " + vals).strip()
+                    params[extra] = ""
+                    anchors.append({"cy": cy, "key": extra})
+            elif val_items and not key_items:
+                # value 续行(一键多值): 归 cy 上方最近的 key anchor
+                above = [a for a in anchors if a["cy"] < cy]
+                if above:
+                    anc = max(above, key=lambda a: a["cy"])
+                    vals = " ".join(it["text"].strip() for it in val_items)
+                    params[anc["key"]] = (params.get(anc["key"], "") + " " + vals).strip()
         return params
 
     def _find_params_entry_by_keywords(self, keywords, items):
@@ -1108,6 +1181,7 @@ class DouyinCrawler:
           - 参数页(有"产品参数"标题)         → back 关参数页
           - 详情页(底部 客服/加入购物 操作栏)  → back 回列表
             (详情页顶部也有"找同款"tab、底部推荐区有价格，故详情操作栏优先于"找同款")
+          - 直播页(底部"说点什么"评论框)      → back 退出直播(退出详情时偶发误进直播)
           - 列表页(左上角"找同款"标题 + 无详情操作栏) → 成功返回 True
           - 其它(相册/拍同款首页)             → 退过头返回 False(run_detail 的 _reenter_list 兜底)
         列表判据用"找同款"而非"有价格"——详情页底部推荐商品也带价格，会误判为列表。
@@ -1121,15 +1195,19 @@ class DouyinCrawler:
                 and it["cy"] > self.adb.dp(600) for it in items
             )
             has_ztk = any("找同款" in it["text"] for it in items)
+            # 直播页(误进直播)：底部评论框"说点什么"是直播/视频页独有，详情/列表/参数页都没有
+            is_live = any("说点什么" in it["text"] for it in items)
             if has_param_title:
                 where = "参数页"
             elif in_detail:
                 where = "详情页"
+            elif is_live:
+                where = "直播页"
             elif has_ztk:
                 self.logger.info(f"back链: 第{i}次 已到列表(找同款标题) ✓")
                 return True
             else:
-                self.logger.info(f"back链: 第{i}次 落到相册/拍同款首页(非参数页/详情/列表) → 退过头")
+                self.logger.info(f"back链: 第{i}次 落到相册/拍同款首页(非参数页/详情/直播/列表) → 退过头")
                 return False
             self.logger.info(f"back链: 第{i}次 在{where}，back 继续")
             self.adb.back()
@@ -1294,11 +1372,12 @@ class DouyinCrawler:
                     self._reenter_list()
                     idle_scrolls = 0
                     continue
-                # 只点左半屏商品(避开右下直播入口)，cx>50 排除屏幕左边缘误识别
-                prices = [p for p in all_prices if 50 < p["cx"] < w * 0.5]
+                # 全屏商品都抓(双列左右都点)：点价格文字坐标进详情，价格在卡片中部，
+                # 不会碰到卡片右下角的直播入口。cx>50 排除屏幕左边缘误识别。
+                prices = [p for p in all_prices if p["cx"] > 50]
                 p = next((x for x in prices if _norm_price(x["text"]) not in seen_prices), None)
                 self.logger.info(
-                    f"列表扫描: 识别价格{len(all_prices)}个(左半屏{len(prices)}个) "
+                    f"列表扫描: 识别价格{len(all_prices)}个(可点击{len(prices)}个) "
                     f"{[x['text'] + '@cx' + str(int(x['cx'])) for x in all_prices]} | "
                     f"已抓{seen_prices} | {'→点击' + p['text'] if p else '→下滑'}"
                 )
@@ -1306,8 +1385,7 @@ class DouyinCrawler:
                     # 当前屏无未抓商品：先重 OCR 一次(PaddleOCR 偶发漏识别价格，
                     # 否则会漏抓当前屏剩余商品就下滑)，确认确实没有才下滑
                     items2 = self._shot_ocr()
-                    prices2 = [x for x in self.ocr.find_prices(items2)
-                               if 50 < x["cx"] < w * 0.5]
+                    prices2 = [x for x in self.ocr.find_prices(items2) if x["cx"] > 50]
                     p = next((x for x in prices2 if _norm_price(x["text"]) not in seen_prices), None)
                     if p:
                         self.logger.info("重OCR 发现漏识别的新商品价格")

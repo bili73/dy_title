@@ -20,15 +20,25 @@ config.py
 """
 
 import os
+import sys
+import json
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _adb_path():
+    """adb.exe 路径：优先 exe/脚本同目录的 adb.exe(打包后随文件夹带)，
+    没有则回退开发机绝对路径(开发时用)。"""
+    base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else BASE_DIR
+    local = os.path.join(base, "adb.exe")
+    return local if os.path.isfile(local) else r"D:\Android\platform-tools\adb.exe"
 
 
 # ==============================================================================
 # 1. adb 配置
 # ==============================================================================
 ADB_CONFIG = {
-    "adb_path": r"D:\Android\platform-tools\adb.exe",   # adb 绝对路径（已确认）
+    "adb_path": _adb_path(),             # adb.exe：优先同目录，无则开发机路径
     # "auto" = 自动取 `adb devices` 第一个在线设备；想锁死某台就填具体序列号
     # （如原写死值 "1551169392ZZZZZ"，vivo V2136A / PD2136）
     "udid": "auto",
@@ -110,6 +120,11 @@ DETAIL_CONFIG = {
     # 用比 param_row_cy_tol 更小的值，避免 key 名尾部续行(cy 差约 35~44px)被误聚进上一行
     # (否则续行"素"会和 key"后置摄像头像"挤成同行、cx 最小被当 key)。
     "param_full_row_cy_tol_dp": 7,
+    # 网格布局(value上+key下)相邻两行 cy 差区间 [dp]：网格行距约 65px、左右行距约 85px，
+    # 用 (45,81)px 区分网格对(collect_params_full 识别网格用)。
+    "grid_dy_dp": (15, 27),
+    # 网格对 cx 列对齐容差 [dp]：value 行与 key 行对应列 cx 差上限(实测约 63px)
+    "grid_cx_tol_dp": 27,
 }
 
 
@@ -158,3 +173,37 @@ OCR_CONFIG = {
     "paddleocr_url": "http://localhost:9300/ocr",
     "timeout": 120,                      # 单次 OCR 请求超时(秒)；PaddleOCR CPU 推理较慢
 }
+
+
+# ==============================================================================
+# 8. 设备校准数据(per udid) — 运营在前端校准的坐标比例，换设备/相册改版后重新校准
+# ==============================================================================
+# 存结构: { "<udid>": { "album_first_image": {"x": 0.125, "y": 0.22}, ... } }
+# 相册首图坐标比例(upload_image 用)：x/y 是相对屏宽高的比例，tap(w*x, h*y)。
+CALIBRATION_FILE = os.path.join(BASE_DIR, "calibration.json")
+
+
+def load_calibration():
+    """读取全部校准数据 {udid: {key: value}}。文件不存在/损坏返回 {}。"""
+    if os.path.isfile(CALIBRATION_FILE):
+        try:
+            with open(CALIBRATION_FILE, "r", encoding="utf-8") as f:
+                return json.load(f) or {}
+        except Exception:
+            return {}
+    return {}
+
+
+def save_calibration(udid, key, value):
+    """保存某设备某项校准值(value 为 dict，如 {"x":0.125,"y":0.22})。原子写(先 tmp 再 replace)。"""
+    data = load_calibration()
+    data.setdefault(udid, {})[key] = value
+    tmp = CALIBRATION_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, CALIBRATION_FILE)
+
+
+def get_calibration(udid, key, default=None):
+    """取某设备某项校准值，无则 default。"""
+    return load_calibration().get(udid, {}).get(key, default)

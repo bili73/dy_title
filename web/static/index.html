@@ -250,6 +250,11 @@
         <div class="hint">可手输，或点「浏览…」图形化选本地目录；默认 output/。</div>
       </div>
 
+      <div class="field">
+        <button type="button" class="btn ghost" id="calibrateBtn">✥ 校准相册首图（换设备后用）</button>
+        <div class="hint">换设备/相册改版后点此：进相册截图 → 在图上点一下首图位置 → 自动保存，后续抓取用此坐标。</div>
+      </div>
+
       <div class="actions">
         <button class="btn" id="startBtn" disabled>开始抓取</button>
         <button class="btn ghost" id="pauseBtn" style="display:none">⏸ 暂停</button>
@@ -295,6 +300,26 @@
       <div class="modal-foot">
         <button type="button" class="btn ghost" id="dirUp" style="width:auto;padding:8px 14px">↑ 上一级</button>
         <button type="button" class="btn" id="dirPick" style="width:auto;padding:8px 14px">选择此目录</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 校准相册首图弹层 -->
+  <div class="modal" id="calibrateModal">
+    <div class="modal-box">
+      <div class="modal-head">
+        <h2 style="margin:0">校准相册首图</h2>
+        <button type="button" class="x" id="calibrateClose">×</button>
+      </div>
+      <div class="modal-path">在下方截图上，点击「首张图片」（最新推送的图）的中心位置</div>
+      <div style="padding:12px 16px; text-align:center; background:#1d1d1f;">
+        <img id="calibrateImg" alt="相册截图" style="max-width:100%; max-height:55vh; cursor:crosshair; display:none;" />
+        <span id="calibratePh" style="color:#86868b;font-size:12px;">正在进入相册截图，请稍候…</span>
+      </div>
+      <div id="calibrateCoord" style="padding:8px 16px; font-size:12px; color:var(--muted); font-family:Consolas,monospace; min-height:18px;"></div>
+      <div class="modal-foot">
+        <button type="button" class="btn ghost" id="calibrateRedo" style="width:auto;padding:8px 14px">重新截图</button>
+        <button type="button" class="btn" id="calibrateSave" disabled style="width:auto;padding:8px 14px">保存校准</button>
       </div>
     </div>
   </div>
@@ -502,6 +527,64 @@
     };
     dirModal.onclick = (e) => { if (e.target === dirModal) dirModal.classList.remove("show"); };
 
+    // ---- 校准相册首图(运营换设备后点选首图位置，自动保存坐标比例) ----
+    const calibrateBtn = $("calibrateBtn"), calibrateModal = $("calibrateModal");
+    const calibrateImg = $("calibrateImg"), calibratePh = $("calibratePh");
+    const calibrateCoord = $("calibrateCoord"), calibrateSave = $("calibrateSave");
+    const calibrateRedo = $("calibrateRedo"), calibrateClose = $("calibrateClose");
+    let calibrateXY = null;
+    function calibrateReset() {
+      calibrateXY = null;
+      calibrateSave.disabled = true;
+      calibrateCoord.textContent = "";
+      calibrateImg.style.display = "none";
+      calibrateImg.src = "";
+      calibratePh.style.display = "block";
+    }
+    async function calibrateStart() {
+      calibrateReset();
+      calibratePh.textContent = "正在进入相册截图，请稍候…";
+      calibrateModal.classList.add("show");
+      appendLog("✥ 开始校准相册首图（进入相册截图）", "sys");
+      try {
+        const r = await fetch("/api/calibrate/album/start", { method: "POST" });
+        if (!r.ok) { const e = await r.json().catch(() => ({})); showToast("启动校准失败: " + (e.detail || r.status)); calibrateModal.classList.remove("show"); return; }
+        const data = await r.json();
+        if (data.status === "existing" && data.shot_url) {
+          // 之前已截图未保存，直接显示已有截图(不重新进相册)
+          calibrateImg.src = data.shot_url;
+          calibrateImg.style.display = "block";
+          calibratePh.style.display = "none";
+          calibrateCoord.textContent = "已加载上次截图，直接点击首图位置即可";
+        }
+        // status === "started"：等 SSE calibrate_ready 推截图
+      } catch (e) { showToast("校准出错: " + e.message); calibrateModal.classList.remove("show"); }
+    }
+    calibrateBtn.onclick = calibrateStart;
+    calibrateImg.onclick = (e) => {
+      const rect = calibrateImg.getBoundingClientRect();
+      const x = (e.clientX - rect.left) / rect.width;
+      const y = (e.clientY - rect.top) / rect.height;
+      calibrateXY = { x_ratio: x, y_ratio: y };
+      calibrateCoord.textContent = `✓ 已选首图位置: x=${x.toFixed(3)}  y=${y.toFixed(3)}（相对屏幕比例），点「保存校准」`;
+      calibrateSave.disabled = false;
+    };
+    calibrateSave.onclick = async () => {
+      if (!calibrateXY) return;
+      try {
+        const r = await fetch("/api/calibrate/album/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(calibrateXY) });
+        if (!r.ok) { const e = await r.json().catch(() => ({})); showToast("保存失败: " + (e.detail || r.status)); return; }
+        showToast("校准已保存，后续抓取将用此坐标选首图");
+        calibrateModal.classList.remove("show");
+      } catch (e) { showToast("保存出错: " + e.message); }
+    };
+    calibrateRedo.onclick = calibrateStart;  // 重新进相册截图
+    calibrateClose.onclick = async () => {
+      await fetch("/api/calibrate/album/cancel", { method: "POST" });
+      calibrateModal.classList.remove("show");
+    };
+    // 校准是精细操作，不点背景关闭(只能用右上角 × 显式取消)
+
     // ---- SSE 事件流 ----
     function connectSSE() {
       const es = new EventSource("/api/events");
@@ -526,6 +609,16 @@
           shot.src = ev.url;
           shot.classList.add("show");
           shotPh.style.display = "none";
+        } else if (ev.type === "calibrate_ready") {
+          calibrateImg.src = ev.shot_url;
+          calibrateImg.style.display = "block";
+          calibratePh.style.display = "none";
+        } else if (ev.type === "calibrate_done") {
+          appendLog("✅ 相册首图校准已保存", "sys");
+        } else if (ev.type === "calibrate_failed") {
+          appendLog("❌ 校准失败: " + (ev.error || ""), "lv-ERROR");
+          showToast("校准失败: " + (ev.error || ""));
+          calibrateModal.classList.remove("show");
         }
       };
       es.onerror = () => {

@@ -80,6 +80,9 @@ class CrawlerState:
         self._subscribers: list = []
         self._lock = threading.Lock()
         self._last_shot_mtime: float = 0.0
+        # 相册首图校准(运营在前端点选首图位置)：calibrate_shot 非空 = 有截图待确认
+        self.calibrate_shot: Optional[str] = None
+        self.calibrate_udid: Optional[str] = None
 
     def subscribe(self) -> queue.Queue:
         """新建一个 SSE 订阅队列并注册。"""
@@ -255,11 +258,79 @@ def _run_crawl(mode: str, max_goods: int, excel_dir: str, image_path: str,
         STATE.crawler = None  # 抓取结束（正常/终止/出错）清理引用
 
 
+def _run_calibrate_album():
+    """校准线程：进相册选图页 + 截图，就绪后广播 calibrate_ready(前端显示截图点选)。
+
+    失败广播 calibrate_failed。运营点首图后调 /api/calibrate/album/save 存坐标。
+    """
+    crawler = None
+    handlers = []
+    try:
+        crawler = DouyinCrawler()
+        STATE.calibrate_udid = crawler.adb.udid
+        handlers = [_attach_sse_handler(crawler.logger), _attach_sse_handler(crawler.adb.logger)]
+        shot = crawler.calibrate_album_enter()
+        if shot:
+            STATE.calibrate_shot = shot
+            STATE.broadcast({"type": "calibrate_ready",
+                             "shot_url": f"/api/shot/{os.path.basename(shot)}?t={int(time.time())}"})
+        else:
+            STATE.broadcast({"type": "calibrate_failed", "error": "进相册选图页失败"})
+    except Exception as e:
+        logging.getLogger("web.server").exception("校准线程异常")
+        STATE.broadcast({"type": "calibrate_failed", "error": f"{type(e).__name__}: {e}"})
+    finally:
+        for h in handlers:
+            if h and crawler:
+                crawler.logger.removeHandler(h)
+                crawler.adb.logger.removeHandler(h)
+
+
 def _attach_sse_handler(logger: logging.Logger) -> SseLogHandler:
     """给指定 logger 挂一个 SseLogHandler，返回它便于事后摘除。"""
     h = SseLogHandler()
     logger.addHandler(h)
     return h
+
+
+@app.post("/api/calibrate/album/start")
+async def calibrate_album_start():
+    """启动相册首图校准：后台进相册截图，前端收到 calibrate_ready 后点选首图。"""
+    if STATE.state == CrawlerState.RUNNING:
+        raise HTTPException(409, "抓取在运行，请等待完成后再校准")
+    if STATE.calibrate_shot:
+        # 已有校准截图(之前截了没保存/误关)：直接返回它，不重新进相册浪费时间
+        return {"status": "existing",
+                "shot_url": f"/api/shot/{os.path.basename(STATE.calibrate_shot)}?t={int(time.time())}"}
+    threading.Thread(target=_run_calibrate_album, daemon=True).start()
+    return {"status": "started"}
+
+
+@app.post("/api/calibrate/album/save")
+async def calibrate_album_save(request: Request):
+    """保存运营点选的首图坐标比例到 calibration.json(per udid)。body: {x_ratio, y_ratio}。"""
+    if not STATE.calibrate_shot or not STATE.calibrate_udid:
+        raise HTTPException(400, "无校准截图，先调 /api/calibrate/album/start")
+    body = await request.json()
+    try:
+        x, y = float(body["x_ratio"]), float(body["y_ratio"])
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(400, "需要 x_ratio, y_ratio (0~1 比例)")
+    if not (0 <= x <= 1 and 0 <= y <= 1):
+        raise HTTPException(400, "x_ratio/y_ratio 必须在 0~1 之间")
+    config.save_calibration(STATE.calibrate_udid, "album_first_image", {"x": x, "y": y})
+    STATE.calibrate_shot = None
+    STATE.calibrate_udid = None
+    STATE.broadcast({"type": "calibrate_done"})
+    return {"status": "saved"}
+
+
+@app.post("/api/calibrate/album/cancel")
+async def calibrate_album_cancel():
+    """取消校准(丢弃截图)。"""
+    STATE.calibrate_shot = None
+    STATE.calibrate_udid = None
+    return {"status": "cancelled"}
 
 
 @app.post("/api/pause")
