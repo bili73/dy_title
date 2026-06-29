@@ -76,6 +76,12 @@ def image_exists(image):
     return image in (r.stdout or "").split()
 
 
+def container_image(name):
+    """运行中容器的镜像名(IMAGE 列)，容器不在跑返回空串。"""
+    r = _run(["docker", "ps", "--filter", f"name=^{name}$", "--format", "{{.Image}}"])
+    return (r.stdout or "").strip()
+
+
 def _pause_exit():
     """报错后暂停等回车(避免 exe 闪退看不到错误)。"""
     try:
@@ -91,6 +97,14 @@ def ensure_ocr(d):
         _pause_exit()
         return False
     state = container_state(OCR_CONTAINER)
+    # 容器在跑但镜像非预期(如同事机器原来同名 dev-paddleocr 容器用的是别的慢镜像)
+    # → 删掉重新部署我们的小模型镜像，避免复用慢 OCR
+    if state == "running":
+        img = container_image(OCR_CONTAINER)
+        if img and OCR_IMAGE not in img:
+            print(f"OCR 容器在跑但镜像非预期({img})，替换为 {OCR_IMAGE}...")
+            _run(["docker", "rm", "-f", OCR_CONTAINER])
+            state = "none"
     if state == "running":
         print("[OK] OCR 容器已在运行")
     elif state == "exists":
