@@ -147,6 +147,37 @@ def ensure_ocr(d):
     return False
 
 
+def warmup_ocr(d):
+    """OCR 预热：adb 截图 + POST /ocr 跑一次(首次推理 warm-up)。
+
+    OCR 首次推理慢(模型 warm-up，曾实测 16-32s)，会卡住 enter_scan 找搜索(12s
+    循环等不及)。预热后 enter_scan/抓取的 OCR 已热，4s 正常。设备未连接则跳过(不崩)。
+    """
+    adb = os.path.join(d, "adb.exe")
+    if not os.path.isfile(adb):
+        print("(OCR 预热跳过: 无 adb.exe)")
+        return
+    shot = os.path.join(d, "_ocr_warmup.png")
+    try:
+        print("-> OCR 预热(首次推理较慢，请等待)...")
+        with open(shot, "wb") as f:
+            subprocess.run([adb, "exec-out", "screencap", "-p"],
+                           stdout=f, timeout=15, check=False)
+        if not os.path.isfile(shot) or os.path.getsize(shot) < 1000:
+            print("(OCR 预热跳过: 设备未连接/未授权，无法截图，跳过)")
+            return
+        with open(shot, "rb") as f:
+            requests.post(f"http://localhost:{OCR_PORT}/ocr", files={"file": f}, timeout=120)
+        print("[OK] OCR 预热完成")
+    except Exception as e:
+        print(f"(OCR 预热跳过: {e})")
+    finally:
+        try:
+            os.remove(shot)
+        except Exception:
+            pass
+
+
 def main():
     """启动器主流程：部署 OCR -> 启动 Web -> 开浏览器。"""
     d = app_dir()
@@ -159,6 +190,7 @@ def main():
     if not ensure_ocr(d):
         _pause_exit()
         return
+    warmup_ocr(d)  # OCR 首次推理预热(避免 enter_scan 找搜索首次慢超时)
 
     print(f"\n-> 启动 Web 服务(端口 {WEB_PORT})，浏览器即将自动打开...\n")
     # 延迟 2 秒开浏览器(等 web server 起来)
