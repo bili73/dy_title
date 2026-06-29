@@ -640,13 +640,13 @@ class DouyinCrawler:
     def calibrate_album_enter(self):
         """校准模式：进相册选图页 + 截图，返回截图绝对路径。供运营在前端点首图位置校准。
 
-        流程：start_app → enter_scan → push_image → 点「相册」进选图页 → 截图(不点首图)。
+        流程：start_app → enter_scan → 点「相册」进选图页 → 截图(不点首图)。
         运营在前端截图上点首图，调 /api/calibrate/album/save 存坐标比例(per udid)。
+        不 push_image：校准的是「首图坐标」，与相册内容无关；且打包后无 sample.jpg。
         """
         self.start_app()
         if not self.enter_scan():
             return None
-        self.push_image()
         self.logger.info("校准：进入相册选图页 ...")
         if not self._tap_keyword(locators.ALBUM, settle=2):
             self.logger.warning("校准：未找到'相册'入口")
