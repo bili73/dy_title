@@ -34,3 +34,8 @@ calibration.json.tmp
 
 # OCR 镜像 tar(打包用，太大不进 git)
 paddleocr.tar
+
+# PyInstaller 打包产物(exe 大，用 Release/网盘分发，不进 git)
+build/
+dist/
+*.spec
