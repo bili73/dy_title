@@ -1,101 +1,129 @@
-# 抖音商城「拍同款」抓取（adb + RapidOCR）
+# 抖音商城「拍同款」抓取（adb + PaddleOCR）
 
-用 **adb + RapidOCR** 操控真机上的抖音商城 App（`com.ss.android.ugc.livelite`），
-自动走「拍同款 / 图片搜索」，抓取同款商品的**标题、价格、店铺**；
-加 `--detail` 可逐个进入商品详情页，抓取**完整标题 + 完整参数**(列表页标题被截断，
-参数在详情页专门网格容器中，需下滑才出现)。
+用 **adb + PaddleOCR** 操控真机上的抖音商城 App（`com.ss.android.ugc.livelite`），
+自动走「拍同款 / 图片搜索」，抓取同款商品的**标题、价格、店铺**；进详情页抓取
+**完整标题 + 完整参数**（列表页标题被截断，参数在详情页专门容器中需下滑才出现）。
 
-> **为什么不用 Appium？**
-> livelite 是 Flutter/自绘应用，Appium UiAutomator2 读取其元素树必崩（socket hang up，
-> 经多版本 driver/server 验证）。改用 **adb 截图 + RapidOCR 识别文字坐标 + OpenCV 模板匹配**，
-> 对 Flutter 界面稳定可用（已验证 RapidOCR 完美识别 livelite 商城首页 59 个文字块）。
+> **为什么不用 Appium？** livelite 是 Flutter/自绘应用，Appium UiAutomator2 读其
+> 元素树必崩。改用 **adb 截图/点击/滑动 + PaddleOCR 识别文字坐标** 驱动，对 Flutter
+> 界面稳定可用。
 
 ---
 
 ## 一、环境
 
-| 组件 | 位置 / 版本 | 备注 |
-|------|-------------|------|
-| Python | 3.12（uv 托管） | 见 `.python-version` |
-| uv | `C:\Users\admin\.local\bin` | 包管理 |
-| adb | `D:\Android\platform-tools` | 已在 config 配绝对路径 |
-| 真机 | vivo V2136A (PD2136) / Android 16 | USB 调试已开 |
-| 目标 App | 抖音商城 livelite | **需先手动登录一次** |
-
-**不需要** Appium / Node / JDK / Appium Inspector。
+| 组件 | 要求 | 备注 |
+|------|------|------|
+| Python | 3.12（uv 托管） | `.python-version` |
+| uv | 包管理 | `uv sync` 装依赖 |
+| adb | platform-tools | exe 同目录或 `config.ADB_CONFIG.adb_path` |
+| **OCR 服务** | PaddleOCR docker（PP-OCRv6 small，9300） | 见下「OCR 服务」；返回每行 4 角点 box |
+| 真机 | USB 调试已开，`adb devices` 可见 | livelite **需先手动登录一次** |
 
 ---
 
-## 二、安装依赖
+## 二、安装
 
 ```powershell
-cd D:\桌面\抖音数据抓取(非影刀)
-uv sync
+uv sync                    # 装 Python 依赖
 ```
 
+### OCR 服务（PaddleOCR docker）
+
+抓取依赖 OCR HTTP 服务（`config.OCR_CONFIG`，默认 `http://localhost:9300/ocr`）：
+返回 `{lines:[{text, box, score}]}`，box 为 4 角点（算文字中心坐标驱动点击）。
+
+- **Docker 版**（本项目）：`D:\dev-services\paddleocr`（Dockerfile + app.py），
+  `docker build -t dev-services-paddleocr .` + `docker run -d --name dev-paddleocr -p 9300:9300 dev-services-paddleocr`
+- **无 docker 版**：见 `D:\桌面\抖音数据抓取_无docker`（OcrLocator 换 RapidOCR 本地，exe 打包即用）
+
 ---
 
-## 三、准备图片
+## 三、运行
 
-把待搜索图片放到 `images\sample.jpg`（或运行时 `--image` 指定）。建议清晰、主体居中。
-
----
-
-## 四、运行
+### CLI
 
 ```powershell
 # 默认：只抓列表(标题/价格/店铺)
 uv run python main.py
 
-# 进详情抓完整标题 + 完整参数(逐个进商品详情页 → 点参数容器进完整参数页 → 上滑收集全部参数)
+# 进详情抓完整标题 + 完整参数
 uv run python main.py --detail --max-goods 5
 
-# 指定图片：
-uv run python main.py --detail --max-goods 3 --image "D:\some\shoe.jpg"
+# 临时覆盖搜索图 + 参数容器关键词(详情模式定位参数入口用)
+uv run python main.py --detail --max-goods 3 --image "D:\xxx.jpg" --params-keywords "类型,速度级别"
 ```
 
-结果输出到 `output\`：
-- `douyin_results.json` / `douyin_results.txt`：结构化数据 + 可读摘要
-- `douyin_results.xlsx`：**Excel 表**(标题 + 价格 + 店铺 + 参数键值对，每商品一行)
-- `screenshots\shot_N.png`：每步调试截图
+### Web 前端（推荐，给运营用）
+
+```powershell
+uv run python -m web.server          # 启动后自动开浏览器 http://localhost:8010
+```
+
+前端功能：上传搜索图 / 选模式 / 设商品数 / **参数容器关键词** / Excel 目录 /
+**结果文件名** / **相册首图校准**（换设备点选）/ 实时日志 + 截图 / 结果下载。
 
 ---
 
-## 五、真机调试（首次必做）
+## 四、核心机制
 
-拍同款流程的入口、按钮文案、结果页布局需按真机实际界面校准：
+### 参数容器关键词（进详情抓参数的关键）
 
-| 文件 | 调什么 |
-|------|--------|
-| `config.py` | `adb_path`、`udid`、`scan_activity`（拍同款 Activity）、图片路径 |
-| `locators.py` | OCR 关键词（搜索/相机/相册/确认/返回 等），按实际界面文案调 |
-| `douyin_crawler.py` | `enter_scan`（进拍同款）、`upload_image`（选图坐标）、`collect_goods`（商品切分） |
+详情页参数入口卡片（左图标 + 右参数摘要文字），图标样式多变（齿轮/列表/表盘）。
+**靠关键词 OCR 定位**：前端填该品类的参数键（如轮胎 `类型,速度级别`，手机
+`维修方式,上市时间`），OCR 命中参数摘要行 → 点击进完整参数页。第一个商品抓完后
+关键词池**自动累积**（抓到的参数键并入池），后续同品类商品命中率更高。
 
-**调试方法**：运行后看 `output\screenshots\shot_N.png`（每步截图）+ 控制台 OCR 日志，
-确认文字识别准不准、点击坐标对不对，据此调整关键词/坐标。
+### 完整参数配对（纯结构，去词典）
 
-关键流程点：
-1. **进拍同款**：首页 OCR 找「搜索」按钮 → 点其左侧相机图标 → 进拍同款
-2. **选图**：相册 → 点首图 → 完成（首图坐标用屏幕比例估算）
-3. **进详情(避直播)**：只点列表**左半屏**商品(cx &lt; 屏宽/2)，避开卡片右下角直播入口；进详情后**等待 4 秒**+价格出现稳定，再操作（页面有直播浮窗，急点易误进直播）
-4. **完整标题/价格/店铺**：详情页第0屏(不下滑)即含完整标题+原价+券后价+店铺
-5. **完整参数**：下滑找「退货包邮券·7天无理由退货」锚点 → 点其上方参数容器进**完整参数页** → **上滑**收集全部参数(15~22 项键值对)
+参数详情页布局：key 在最左一列（cx 小），value 在右（cx 大），同一行。
+`collect_params_full` 纯位置配对（不依赖参数名词典，新品类零维护），兼容：
+- **左右**（key 左 + value 右，同行）
+- **上下网格**（value 上 + key 下，列 cx 对齐）
+- **key 名续行**（OCR 把过长 key 名头部/尾部挤到独立行 → 找 cy 最近的 key 行合并）
+- **一键多值**（同行多 value + 下方续行 value 归并）
+
+### back 状态机
+
+详情返回列表用状态机（按落点决定 back）：参数页/详情/直播（「说点什么」评论框）→
+继续 back；列表（「找同款」标题）→ 停；其它 → 退过头兜底重进。
+
+### 相册首图校准
+
+`upload_image` 选首图坐标优先用运营校准值（per udid，`calibration.json`）；
+换设备/相册改版后前端「校准相册首图」点选一次首图位置即可。
+
+---
+
+## 五、打包成 exe（给非技术人员）
+
+```powershell
+uv run pip install pyinstaller
+uv run python build_exe.py          # → dist/抖音抓取/
+```
+
+打包后把 `paddleocr.tar`（`docker save` 导出镜像）+ `adb.exe(+dll)` 放进 dist 同目录，
+压缩发同事。双击 exe → launcher 自动 `docker load` + run OCR + 启动 web + 开浏览器。
+
+详见 `README.txt`（同事使用说明）+ `launcher.py`（启动器）。
 
 ---
 
 ## 六、项目结构
 
 ```
-抖音数据抓取(非影刀)/
-├── pyproject.toml / uv.lock / .python-version   # uv 环境
-├── config.py            # 配置（adb/设备/App/图片/输出/模板）
-├── locators.py          # OCR 关键词
 ├── douyin_crawler.py    # 核心：AdbController + OcrLocator + TemplateMatcher + 流程
-├── main.py              # 运行入口
-├── test_ocr.py          # OCR 识别验证脚本（调试用）
+├── config.py            # 配置（adb/设备/App/详情坐标/输出/OCR/校准读写）
+├── locators.py          # OCR 关键词 + 参数名提示词 + 卖点/噪音词
+├── main.py              # CLI 入口 + save_results/save_excel（支持自定义文件名）
+├── launcher.py          # exe 启动器（docker 检测/load/run + OCR 预热 + 开浏览器）
+├── build_exe.py         # PyInstaller 打包脚本
+├── web/                 # Web 前端（FastAPI + SSE）
+│   ├── server.py        #   后端（/api/start, 校准, SSE 事件流）
+│   └── static/index.html#   前端单页
 ├── images/              # 待搜索图片（sample.jpg）
-├── templates/           # 图标模板（可选，用于模板匹配找相机/搜索图标）
-└── output/              # 结果 JSON/TXT + 调试截图
+├── output/              # 结果 JSON/TXT/Excel + 调试截图
+└── calibration.json     # 设备校准数据（per udid，不进 git）
 ```
 
 ---
@@ -105,40 +133,31 @@ uv run python main.py --detail --max-goods 3 --image "D:\some\shoe.jpg"
 ```json
 [
   {
-    "title": "SANC盛色27英寸2K200Hz电竞显示器IPS硬件低蓝光G72Max增强版",
-    "price": "券后价￥729",
-    "coupon_price": "券后价￥729",
-    "shop": "抖音旗舰",
+    "title": "一号ARISUN1系列...",
+    "price": "¥999起", "coupon_price": "券后价¥894.1起", "shop": "官方旗舰店",
     "params": {
-      "是否触摸屏": "否",
-      "屏幕尺寸": "27",
-      "刷新率": "200hz",
-      "分辨率": "2560*1440",
-      "面板类型": "FAST-IPS",
-      "品牌": "SANC/盛色",
-      "型号": "G72Max增强版",
-      "重量": "7.22kg",
-      "CCC证书编号": "2024010903638619",
-      "生产企业名称": "宜宾佳信电子科技有限公司",
-      "保修期": "3年"
+      "电压": "12V", "电源方式": "点烟器电源", "适用对象": "普通汽车轮胎",
+      "电池容量": "5001MAh(含)-20000MAh(不含)", "功能": "应急辅助"
     }
   }
 ]
 ```
 
-> 完整参数共 15~22 项(点参数容器进完整参数页 + 上滑收集)。
-
-Excel 表 (`douyin_results.xlsx`)：每商品一行，参数合并到「参数」列(换行显示 `key: value`)。
+结果输出到 `output\`：`douyin_results.json/.txt/.xlsx`（Excel 每商品一行，参数合并到
+「参数」列换行显示）。**文件名可自定义**（CLI `--output` 无；web 前端「结果文件名」，
+留空覆盖模式用当前时间戳，追加模式用 douyin_results）。
 
 ---
 
-## 八、常见问题
+## 八、调试（出问题第一动作）
 
-- **`未抓取到商品`**：看 `output\screenshots\` 截图，确认拍同款是否真进了、结果页 OCR 是否识别到价格。
-- **点错位置**：`upload_image` 的首图坐标是估算，按截图实际调整。
-- **OCR 漏识别**：调 `locators.py` 关键词，或降 `config.ocr_score_threshold`。
-- **adb 找不到**：确认 `config.ADB_CONFIG.adb_path` 绝对路径正确，`adb devices` 能看到设备。
-- **拍同款进不去**：手动进一次拍同款，看 `dumpsys activity activities` 的 Activity 名，更新 `scan_activity`。
+看 `output\screenshots\shot_N.png`（每步截图）+ 控制台/web 日志 OCR：
+- 找不到搜索/参数入口 → `locators.py` 关键词、`config.py` 坐标阈值（dp）
+- 参数漏抓/配对错 → `config.py`（`param_key_cx_max`/`param_full_row_cy_tol`/`grid_*`）
+- OCR 慢 → PaddleOCR 换 small 模型 + SCALE 缩图（`app.py`）
+- 多设备 → `config.ADB_CONFIG.udid` 写死（默认 `auto` 取第一个）
+
+详见 `CLAUDE.md`（项目架构 + 调试工作流 + 设计决策）。
 
 ---
 
